@@ -1,0 +1,59 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python cache / test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local generated directories
+/.tmp/
+/tmp_mvbench_main_check/
+/Retool_Video_RL/videorag_cache/
+/Retool_Video_RL/rl_workdir/
+/evaluationVideo/**/workspaces*/
+/evaluationVideo/**/_shared_cache/
+
+# RL-only code kept outside the upload-focused Mix bundle
+/Retool_Video_RL/src/verl/
+/Retool_Video_RL/scripts/run_video_agent_ppo.sh
+/Retool_Video_RL/scripts/start_non_planner_sidecars.sh
+/Retool_Video_RL/scripts/stop_non_planner_sidecars.sh
+
+# Logs
+*.log
+
+# Structured runtime artifacts
+launcher_result.json
+run_report.json
+raw_llm_trace.jsonl
+*_progress.json
+
+# Repo-root generated artifacts
+/knowledge_graph.json
+/search_cache_1k.json
+/sft_trace.json
+
+# Nested project runtime artifacts
+/Retool_Video_RL/run.log

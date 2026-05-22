@@ -1,0 +1,10 @@
+# Normalize common text files in a cross-platform-friendly way.
+* text=auto
+
+# Keep scripts and source files LF-normalized for tooling consistency.
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
