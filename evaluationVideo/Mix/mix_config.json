@@ -15,8 +15,8 @@
     "mvbench": {
       "enabled": true,
       "prompt_template_path": "./mvbench_query_prompt.txt",
-      "dataset_root": "../../../datasets/MVBench/video",
-      "json_root": "../../../datasets/MVBench/json",
+      "dataset_root": "../../datasets/MVBench/video",
+      "json_root": "../../datasets/MVBench/json",
       "allowed_data_types": [
         "video"
       ],
@@ -25,14 +25,14 @@
     "mlvu": {
       "enabled": true,
       "prompt_template_path": "./mlvu_query_prompt.txt",
-      "dataset_root": "../../../datasets/MLVU/MLVU",
+      "dataset_root": "../../datasets/MLVU/MLVU",
       "annotation_root": "./json",
       "video_root": "./video"
     },
     "videomme": {
       "enabled": true,
       "prompt_template_path": "./videomme_query_prompt.txt",
-      "dataset_root": "../../../datasets/Video-MME",
+      "dataset_root": "../../datasets/Video-MME",
       "annotation_path": "./videomme/test-00000-of-00001.parquet",
       "video_id_mapping_path": "./videomme/test-00000-of-00001.parquet",
       "video_search_roots": [

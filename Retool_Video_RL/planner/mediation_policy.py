@@ -3,8 +3,67 @@
 from __future__ import annotations
 
 import json
+import copy
 import re
 from typing import Any, Dict, List, Optional
+from toolkit.time_utils import normalize_visual_time_args, parse_time_seconds, parse_time_range
+
+
+def describe_planner_action(name, args, description="", fallback=""):
+    if description:
+        return description
+    supplied = _normalized_executable_args(args)
+    if supplied:
+        return f"{name}: " + json.dumps(supplied, ensure_ascii=False)
+    return fallback or name
+
+
+def validate_resolved_time_scope(planner_args, tool_name, resolved_args):
+    """Validate explicit absolute time constraints, without guessing time from prose."""
+    if tool_name not in {"Inspect_Frame", "OCR_Extract", "Video_Clip_QA", "Audio_Clip_QA",
+                         "Audio_Event_Detect", "Entity_Track", "Speaker_Diarization",
+                         "Emotion_Analysis", "Action_Recognition", "Cross_Modal_Verify"}:
+        return
+    if planner_args.get("segment_id") or resolved_args.get("segment_id"):
+        return  # Relative segment coordinates are resolved by the video tool.
+    original = normalize_visual_time_args(planner_args)
+    resolved = normalize_visual_time_args(resolved_args)
+    def values(value):
+        return value if isinstance(value, list) else [value]
+    def ranges(args):
+        if args.get("t_start") is not None and args.get("t_end") is not None:
+            return list(zip(values(args["t_start"]), values(args["t_end"])))
+        result = []
+        for key in ("time_range", "video_clip", "audio_segment"):
+            value = args.get(key)
+            pair = parse_time_range(value)
+            if pair:
+                result.append(pair)
+            elif isinstance(value, list):
+                result.extend(pair for item in value if (pair := parse_time_range(item)))
+        return result
+    windows = []
+    if original.get("t_start") is not None and original.get("t_end") is not None:
+        starts, ends = values(original["t_start"]), values(original["t_end"])
+        windows = list(zip(starts, ends))
+    elif original.get("timestamp") is not None:
+        half = max(0.0, parse_time_seconds(original.get("duration")) or 2.0) / 2
+        windows = [(v - half, v + half) for v in values(original["timestamp"])]
+    else:
+        windows = ranges(original)
+    if not windows:
+        return
+    requested = []
+    for key in ("timestamp", "t_start", "t_end"):
+        if resolved.get(key) is not None:
+            requested.extend(values(resolved[key]))
+    resolved_ranges = ranges(resolved)
+    for start, end in resolved_ranges:
+        requested.extend((start, end))
+        if not any(left - .05 <= start <= end <= right + .05 for left, right in windows):
+            raise ValueError(f"Resolved time scope violates planner request: range {(start, end)} is not contained in {windows}.")
+    if requested and any(not any(start - .05 <= v <= end + .05 for start, end in windows) for v in requested):
+        raise ValueError(f"Resolved time scope violates planner request: expected seconds within {windows}, got {requested}. Preserve the original time units and per-action window.")
 
 
 RULE_DIRECT_EXECUTE = "rule_1_direct_execute"
@@ -312,27 +371,16 @@ def compact_tool_schema_for_prompt(schema: Dict[str, Any]) -> Dict[str, Any]:
     for key, property_schema in properties.items():
         if not isinstance(property_schema, dict):
             continue
-        compact_property: Dict[str, Any] = {}
-        property_type = str(property_schema.get("type", "")).strip()
-        if property_type:
-            compact_property["type"] = property_type
-        property_description = _truncate_prompt_text(
-            property_schema.get("description", ""),
-            limit=180,
-        )
-        if property_description:
-            compact_property["description"] = property_description
-        enum_values = property_schema.get("enum")
-        if isinstance(enum_values, list) and enum_values:
-            compact_property["enum"] = [
-                str(item).strip()
-                for item in enum_values[:8]
-                if str(item).strip()
-            ]
-        compact_properties[str(key)] = compact_property or {"type": "any"}
+        # Keep parameter contracts (unions, items, nested properties and defaults) intact.
+        compact_property = copy.deepcopy(property_schema)
+        if isinstance(compact_property.get("description"), str):
+            compact_property["description"] = _truncate_prompt_text(compact_property["description"], limit=180)
+        compact_properties[str(key)] = compact_property
 
     if compact_properties:
-        compact["parameters"] = {"properties": compact_properties}
+        compact["parameters"] = {"type": "object", "properties": compact_properties}
+        if required:
+            compact["parameters"]["required"] = required
     return compact
 
 
@@ -378,11 +426,17 @@ def build_root_mediation_context(
         "[Abstract Tool Description]\n"
         + (description_text or "No description provided by planner."),
         "[Planner-Facing Observation Contract]\n"
-        + "Return only executable concrete Actions. "
-        + "If execution succeeds, the parent planner receives normalized tool results automatically and the successful result does not stay in the sub-agent loop. "
-        + "Only failed executions may be returned to the sub-agent for another repair step within budget. "
+        + "Use executable Actions to continue, or top-level Return to return your local result. "
+        + "After execution, inspect the returned tool results yourself and decide whether to continue or return. "
+        + "Success and failure observations both remain in your context within the existing budget. "
         + "Do not emit Finish in this mode. "
         + "A top-level `Result` note is optional, but it never replaces executable Actions.",
+        "[Intent Preservation Contract]\n"
+        "Preserve the supplied time window, image path, object and requested state (initial/final). "
+        "All numeric times are seconds; 4:21 means 261 seconds, never 4.21 seconds. "
+        "Use only this action's parameters and description; do not borrow a time window from sibling actions. "
+        "When no time is supplied, honor the requested period (such as the initial state) instead of assuming the final window. "
+        "Tool schema validity alone does not establish intent fulfillment.",
     ]
 
     if policy.get("rule") == RULE_LOCKED_TARGET:
@@ -433,3 +487,28 @@ def build_root_mediation_context(
         )
 
     return "\n\n".join(section for section in sections if section)
+
+
+def build_resolver_review_message(request_description: str = "") -> str:
+    """Post-execution review turn: judge the actual results against what the delegated request asks for."""
+    request = " ".join(str(request_description or "").split())
+    if len(request) > 700:
+        request = request[:697] + "..."
+    lines = ["Review the tool results against the delegated request, then Return or continue."]
+    if request:
+        lines.append(f"Delegated request: {request}")
+    lines.extend([
+        "Before Return, check using the actual results, not assumptions:",
+        "1. Coverage: every event, object, option or time range the request names has a result, or you state it was not found. "
+        "A single call over a span much larger than the evidence needs, or one that returned only a coarse description, does not cover a request for exact times or every occurrence; narrow the range and repeat. "
+        "A negative conclusion (not found, does not appear) must rest on perception of the raw video over the relevant range; a summary or caption lookup alone does not establish absence.",
+        "2. Products: collecting observations is not the last step when the request asks for a list, ordering, consolidation across windows, de-duplication, comparison or a count. "
+        "Turn the observed events into records (start and end in seconds; use `evidence_events` when a result has it, since it already converts clip-relative times to absolute seconds), "
+        "then run an executable tool for that step on those records and Return its output. If a SearchResults you already hold contains a suitable tool, execute it now (select it with its `search_id`); only if none does, Search for one. Never repeat a Search whose results you already hold. "
+        "Do not derive the list, order, merged ranges or count by reading the results and working it out yourself in the reply. "
+        "Overlapping windows can report the same event twice, so consolidation belongs to the tool.",
+        "3. Consistency: earlier and later results do not contradict each other; if they do, resolve it or report it.",
+        "A request for one simple observation is complete once that observation is returned. "
+        "Do not repeat calls that cannot add information.",
+    ])
+    return "\n".join(lines)

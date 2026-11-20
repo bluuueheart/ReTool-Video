@@ -2635,31 +2635,63 @@ class VisualProcessor:
                 "A text-only checkpoint cannot produce planner-grounding captions."
             )
 
-        with VideoFileClip(video_path) as video:
-            for index in tqdm(
-                pending_indices,
-                desc=f"Captioning {video_name}",
-                **self._build_tqdm_kwargs(),
+        def _caption_from_frames(index: str, video_frames: List[Image.Image]) -> str:
+            caption = _compact_segment_caption(
+                self._generate_segment_caption_with_oom_retry(video_frames)
+            )
+            if (
+                not caption.strip()
+                or _is_low_information_caption_text(caption)
             ):
-                frame_times = segment_times_info[index]["frame_times"]
-                video_frames = self.encode_video_frames(video, frame_times)
-                caption = _compact_segment_caption(
-                    self._generate_segment_caption_with_oom_retry(video_frames)
+                raise RuntimeError(
+                    "Preprocessing caption generation returned an invalid visual caption. "
+                    f"video={video_name!r}, segment_id={index!r}, model_path={self.model_path!r}. "
+                    "Planner grounding requires a real visually grounded caption, not empty, placeholder, or punctuation-only text."
                 )
-                if (
-                    not caption.strip()
-                    or _is_low_information_caption_text(caption)
+            return caption.strip()
+
+        concurrency = max(1, int(self._caption_concurrency()))
+        with VideoFileClip(video_path) as video:
+            if concurrency <= 1:
+                for index in tqdm(
+                    pending_indices,
+                    desc=f"Captioning {video_name}",
+                    **self._build_tqdm_kwargs(),
                 ):
-                    raise RuntimeError(
-                        "Preprocessing caption generation returned an invalid visual caption. "
-                        f"video={video_name!r}, segment_id={index!r}, model_path={self.model_path!r}. "
-                        "Planner grounding requires a real visually grounded caption, not empty, placeholder, or punctuation-only text."
-                    )
-                captions[index] = caption.strip()
+                    frame_times = segment_times_info[index]["frame_times"]
+                    video_frames = self.encode_video_frames(video, frame_times)
+                    captions[index] = _caption_from_frames(index, video_frames)
+            else:
+                # Remote (vLLM) captioning: frames are read serially (moviepy readers are not thread-safe), but the
+                # requests are issued concurrently so the replicas' continuous batching is used. A bounded window
+                # keeps only a few segments' frames in memory at a time.
+                from concurrent.futures import ThreadPoolExecutor
+
+                window = concurrency * 2
+                progress = tqdm(
+                    total=len(pending_indices),
+                    desc=f"Captioning {video_name}",
+                    **self._build_tqdm_kwargs(),
+                )
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    for start in range(0, len(pending_indices), window):
+                        futures = []
+                        for index in pending_indices[start:start + window]:
+                            frame_times = segment_times_info[index]["frame_times"]
+                            video_frames = self.encode_video_frames(video, frame_times)
+                            futures.append((index, pool.submit(_caption_from_frames, index, video_frames)))
+                        for index, future in futures:
+                            captions[index] = future.result()
+                            progress.update(1)
+                progress.close()
 
         if cache_file:
             self._save_cached_captions(cache_file, captions, segment_index2name)
         return captions
+
+    def _caption_concurrency(self) -> int:
+        """Concurrent caption requests per video (1 = sequential, the in-process HF runtime)."""
+        return 1
 
     def _load_cached_captions(
         self,
@@ -3770,6 +3802,35 @@ class ServiceVisualProcessor(VisualProcessor):
         )
 
 
+class VLLMVisualProcessor(ServiceVisualProcessor):
+    """Caption/QA runtime backed by the shared local vLLM replicas.
+
+    Keeps the in-process caption contract of ``VisualProcessor`` (all sampled frames, global pixel
+    bounds, same caption prompt), so only the inference engine changes.
+    """
+
+    def _caption_cache_model_fingerprint(self) -> str:
+        return VisualProcessor._caption_cache_model_fingerprint(self)
+
+    def _caption_concurrency(self) -> int:
+        try:
+            return max(1, int(os.environ.get("TOOLSTAR_CAPTION_CONCURRENCY", "8") or 8))
+        except ValueError:
+            return 8
+
+    def _load_model(self) -> None:
+        if self._llm is not None:
+            return
+        from core.llm.vllm_provider import get_vllm_provider
+
+        self._llm = get_vllm_provider(self.model_path, self.model_role)
+
+    def _get_visual_service_request_budget(self) -> Tuple[int, int]:
+        # No frame cap (the provider keeps the newest images under the server's per-prompt image limit).
+        _, global_max_pixels = self._get_vision_pixel_bounds()
+        return 1 << 20, global_max_pixels
+
+
 def create_visual_processor(
     model_name: Optional[str] = None,
     model_path: str = "",
@@ -3779,6 +3840,17 @@ def create_visual_processor(
     accelerator_lock: Any = None,
 ) -> VisualProcessor:
     model_role = _infer_visual_model_role(model_name, model_path)
+    from core.llm.vllm_provider import vllm_serves_model
+
+    if vllm_serves_model(model_path or settings.qwen_vl_model_path):
+        return VLLMVisualProcessor(
+            model_name=model_name,
+            model_path=model_path,
+            device=device,
+            max_slice_nums=max_slice_nums,
+            require_local=require_local,
+            accelerator_lock=accelerator_lock,
+        )
     if _visual_service_enabled(model_role):
         return ServiceVisualProcessor(
             model_name=model_name,

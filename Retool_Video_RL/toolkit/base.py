@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import json
 from typing import Any, Dict, Iterable, Optional
 from pydantic import BaseModel, ConfigDict, Field
+from jsonschema import Draft7Validator
 
 
 _PREFERRED_TEXT_KEYS = (
@@ -244,13 +245,16 @@ class BaseTool(BaseModel, ABC):
         Returns:
             True if valid
         """
-        # Basic validation - can be extended with jsonschema
         required_params = self.parameters.get("required", [])
         
         for param in required_params:
             if param not in kwargs:
                 raise ValueError(f"Missing required parameter: {param}")
-        
+        arguments = {key: value for key, value in kwargs.items() if not key.startswith("__")}
+        error = next(Draft7Validator(self.parameters).iter_errors(arguments), None)
+        if error is not None:
+            path = ".".join(str(part) for part in error.absolute_path) or "arguments"
+            raise ValueError(f"Invalid arguments for {self.name} at {path}: {error.message[:300]}")
         return True
 
 

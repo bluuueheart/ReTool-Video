@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import copy
 import time
 import gc
 from collections import Counter, defaultdict, deque
@@ -49,6 +50,7 @@ class RuntimeSession:
         self._timings: Dict[str, float] = defaultdict(float)
         self._cache_stats: Counter[str] = Counter()
         self._recent_tools: Deque[str] = deque(maxlen=24)
+        self._tool_results: Dict[str, Dict[str, Any]] = {}
 
     def ensure_registry_discovered(self, registry: Any) -> None:
         if self._registry_auto_discovered:
@@ -128,6 +130,19 @@ class RuntimeSession:
             return []
         return list(self._recent_tools)[-limit:]
 
+    def note_tool_result(self, tool_name: str, result: Any, *, args=None, status="success", evidence_id=None) -> str:
+        """Record runtime observations, separately from planner-supplied claims."""
+        key = evidence_id or f"observation:{len(self._tool_results) + 1}"
+        if isinstance(result, dict):
+            result["evidence_id"] = key
+        self._tool_results[key] = {"evidence_id": key, "tool": tool_name, "status": status,
+                                   "args": copy.deepcopy(args or {}), "result": copy.deepcopy(result),
+                                   "source_video": self._active_video_path}
+        return key
+
+    def get_tool_results(self) -> Dict[str, Dict[str, Any]]:
+        return copy.deepcopy(self._tool_results)
+
     def record_timing(self, name: str, seconds: float) -> None:
         key = str(name or "").strip()
         if not key:
@@ -147,12 +162,14 @@ class RuntimeSession:
             "timings": dict(self._timings),
             "cache_stats": dict(self._cache_stats),
             "recent_tools": list(self._recent_tools),
+            "tool_results": copy.deepcopy(self._tool_results),
         }
 
     def restore_query_state(self, snapshot: Optional[Dict[str, Any]]) -> None:
         if not isinstance(snapshot, dict):
             self.reset_query_state()
             return
+        self._tool_results = copy.deepcopy(snapshot.get("tool_results") or {})
 
         self._active_video_names = _normalize_video_scope_names(
             snapshot.get("active_video_names") or ()

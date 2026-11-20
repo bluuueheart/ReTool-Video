@@ -57,3 +57,13 @@ raw_llm_trace.jsonl
 
 # Nested project runtime artifacts
 /Retool_Video_RL/run.log
+
+# Local configurations, experiment outputs, and editor backups
+/.env
+/Retool_Video_RL/.env
+/local_runs/
+/models/
+/datasets/
+/evaluationVideo/Mix/Mix_result.json
+/evaluationVideo/Mix/VideoMME_official_output.json
+*.orig_retool

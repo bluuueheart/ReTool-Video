@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import Field
 
 from toolkit.base import BaseTool
+from toolkit.time_utils import parse_time_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -30,24 +31,10 @@ def _get_field(item: Any, field: str, default: Any = None) -> Any:
 
 
 def _parse_time(val: Any) -> float:
-    if val is None:
-        return 0.0
-    if isinstance(val, (int, float)):
-        return float(val)
-    try:
-        if isinstance(val, str) and ":" in val:
-            parts = [float(p) for p in val.split(":")]
-            if len(parts) == 3:
-                h, m, s = parts
-            elif len(parts) == 2:
-                h, m = parts
-                s = 0
-            else:
-                return float(val)
-            return h * 3600 + m * 60 + s
-        return float(val)
-    except Exception:
-        return 0.0
+    seconds = parse_time_seconds(val)
+    if seconds is None:
+        raise ValueError(f"Invalid time value: {val!r}; use seconds, MM:SS or HH:MM:SS.")
+    return seconds
 
 
 def _build_params(required: Dict[str, Dict[str, Any]], optional: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -175,10 +162,21 @@ def h_threshold_filter(data: List[dict], field: str, threshold: float, **_) -> L
 
 
 def h_dedup_by_field(data: List[dict], field: str, **_) -> List[dict]:
+    if any(not isinstance(item, dict) for item in data):
+        raise ValueError("Deduplicate_By_Field requires object records for field-based deduplication.")
+    if data and not any(field in item for item in data):
+        raise ValueError(f"Deduplicate_By_Field: no records contain identity field {field!r}; check the field name.")
     seen = set()
     out = []
-    for item in data:
-        val = _get_field(item, field)
+    missing = object()
+    for index, item in enumerate(data):
+        val = _get_field(item, field, missing)
+        if val is missing or val is None:
+            # Unknown identities cannot establish either equality or distinctness.
+            # Preserve the record instead of aborting the valid remainder or collapsing all None.
+            out.append({**item, "deduplication_uncertain": True,
+                        "deduplication_note": f"Missing identity {field!r}; preserved without merging. A row count is not a verified distinct-event count."})
+            continue
         if val not in seen:
             seen.add(val)
             out.append(item)
@@ -285,7 +283,10 @@ def h_softmax(data: List[dict], field: str, **_) -> List[dict]:
     values = [_get_numeric(_get_field(i, field), 0.0) for i in data]
     if not values:
         return data
-    exp_vals = [math.exp(v) for v in values]
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError("Softmax scores must be finite.")
+    maximum = max(values)
+    exp_vals = [math.exp(v - maximum) for v in values]
     total = sum(exp_vals) or 1.0
     out = []
     for item, ev in zip(data, exp_vals):
@@ -391,7 +392,7 @@ def h_regex_extract(data: List[dict], field: str, pattern: str, **_) -> List[Dic
 
 
 def h_keyword_filter(data: List[dict], field: str, keyword: str, **_) -> List[dict]:
-    return [i for i in data if keyword.lower() in str(_get_field(i, field, "")).lower()]
+    return h_filter_contains(data, field, substring=keyword)
 
 
 def h_truncate_text(data: List[dict], field: str, max_len: int, **_) -> List[dict]:
@@ -443,13 +444,25 @@ def h_time_overlap(range_a: Dict[str, Any], range_b: Dict[str, Any], **_) -> flo
 def h_merge_touching(ranges: List[Dict[str, Any]], tolerance: float = 0.0, **_) -> List[Dict[str, Any]]:
     if not ranges:
         return []
-    sorted_ranges = sorted(ranges, key=lambda r: _parse_time(r.get("start")))
-    merged = [dict(sorted_ranges[0])]
+    from toolkit.time_utils import normalize_temporal_records
+    normalized = normalize_temporal_records(copy.deepcopy(ranges))
+    for row in normalized:
+        if row.get("timestamp_basis") == "absolute":
+            row.setdefault("source_records", [{key: value for key, value in row.items() if key != "source_records"}])
+    sorted_ranges = sorted(normalized, key=lambda r: r["start"])
+    merged = [sorted_ranges[0]]
     for r in sorted_ranges[1:]:
-        if _parse_time(r.get("start")) <= _parse_time(merged[-1].get("end")) + tolerance:
-            merged[-1]["end"] = max(_parse_time(merged[-1].get("end")), _parse_time(r.get("end")))
+        if r["start"] <= merged[-1]["end"] + tolerance:
+            merged[-1]["end"] = max(merged[-1]["end"], r["end"])
+            if r.get("source_records"):
+                merged[-1].setdefault("source_records", []).extend(r["source_records"])
+            if r.get("source_window") and merged[-1].get("source_window"):
+                left, right = merged[-1]["source_window"], r["source_window"]
+                merged[-1]["source_window"] = {"start": min(left["start"], right["start"]), "end": max(left["end"], right["end"])}
+            if r.get("sources"):
+                merged[-1].setdefault("sources", []).extend(r["sources"])
         else:
-            merged.append(dict(r))
+            merged.append(r)
     return merged
 
 
@@ -464,7 +477,14 @@ def h_align_time_buckets(ranges: List[Dict[str, Any]], bucket: float, **_) -> Li
 
 
 def h_clip_time_range(time_range: Dict[str, Any], clip_start: float, clip_end: float, **_) -> Dict[str, Any]:
-    return {"start": max(_parse_time(time_range.get("start")), clip_start), "end": min(_parse_time(time_range.get("end")), clip_end)}
+    original_start, original_end = _parse_time(time_range.get("start")), _parse_time(time_range.get("end"))
+    clip_start, clip_end = _parse_time(clip_start), _parse_time(clip_end)
+    if original_end < original_start or clip_end < clip_start:
+        raise ValueError("Time range end must be at or after start.")
+    start, end = max(original_start, clip_start), min(original_end, clip_end)
+    if end < start:
+        return {"start": None, "end": None, "status": "no_valid_result", "result": "The requested time ranges do not overlap."}
+    return {"start": start, "end": end}
 
 
 def h_expand_time_range(time_range: Dict[str, Any], delta: float, **_) -> Dict[str, Any]:
@@ -476,7 +496,8 @@ def h_shift_time_range(time_range: Dict[str, Any], offset: float, **_) -> Dict[s
 
 
 def h_sort_time_ranges(ranges: List[Dict[str, Any]], **_) -> List[Dict[str, Any]]:
-    return sorted(ranges, key=lambda r: _parse_time(r.get("start")))
+    from toolkit.time_utils import normalize_temporal_records
+    return sorted(normalize_temporal_records(ranges), key=lambda r: r["start"])
 
 
 def h_window_sliding(data: List[Any], window: int = 3, **_) -> List[List[Any]]:
@@ -625,15 +646,15 @@ def h_path_length_filter(
 
 
 def h_score_threshold_rank(data: List[dict], field: str, threshold: float, **_) -> List[dict]:
-    return [i for i in data if _get_numeric(_get_field(i, field), 0.0) >= threshold]
+    return h_threshold_filter(data, field, threshold)
 
 
 def h_topk_score(data: List[dict], k: int = 5, **_) -> List[dict]:
-    return sorted(data, key=lambda x: _get_numeric(_get_field(x, "score"), 0.0), reverse=True)[:k]
+    return h_topk_by_field(data, field="score", k=k)
 
 
 def h_bottomk_score(data: List[dict], k: int = 5, **_) -> List[dict]:
-    return sorted(data, key=lambda x: _get_numeric(_get_field(x, "score"), 0.0))[:k]
+    return h_bottomk_by_field(data, field="score", k=k)
 
 
 def h_rerank_by_score(data: List[dict], weight: float = 1.0, **_) -> List[dict]:
@@ -727,11 +748,11 @@ def h_percentage_change(data: List[float], **_) -> List[float]:
 
 
 def h_boolean_and(flags: List[bool], **_) -> bool:
-    return all(bool(f) for f in flags)
+    return h_all_true(flags)
 
 
 def h_boolean_or(flags: List[bool], **_) -> bool:
-    return any(bool(f) for f in flags)
+    return h_any_true(flags)
 
 
 def h_boolean_not(flag: bool, **_) -> bool:
@@ -1073,7 +1094,7 @@ META_TOOL_SPECS = [
     ("Stddev_Field", "Standard deviation of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "std"], h_stddev_field),
     ("Percentile_10", "10th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.10)),
     ("Percentile_25", "25th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.25)),
-    ("Percentile_50", "50th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.50)),
+    ("Percentile_50", "Legacy alias of Median_Field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], h_median_field),
     ("Percentile_75", "75th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.75)),
     ("Percentile_90", "90th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.90)),
     ("Percentile_95", "95th percentile of numeric field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["aggregation", "percentile"], lambda **k: _percentile(k["data"], k["field"], 0.95)),
@@ -1092,7 +1113,7 @@ META_TOOL_SPECS = [
     ("Filter_Contains", "Filter where field contains substring.", _build_params({"data": PROP_DATA, "field": PROP_FIELD, "substring": PROP_VALUE}), ["filter", "text"], h_filter_contains),
     ("Filter_NotContains", "Filter where field does not contain substring.", _build_params({"data": PROP_DATA, "field": PROP_FIELD, "substring": PROP_VALUE}), ["filter", "text"], h_filter_not_contains),
     ("Threshold_Filter", "Keep items where field >= threshold.", _build_params({"data": PROP_DATA, "field": PROP_FIELD, "threshold": PROP_NUM}), ["filter", "threshold"], h_threshold_filter),
-    ("Deduplicate_By_Field", "Deduplicate by field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["dedup"], h_dedup_by_field),
+    ("Deduplicate_By_Field", "Deduplicate known identities by field. Missing/null identities are preserved with uncertainty, not merged; counting these rows is not a verified distinct-event count. If no record has the field, correct the field name.", _build_params({"data": PROP_DATA, "field": PROP_FIELD}), ["dedup"], h_dedup_by_field),
     ("Select_Fields", "Project selected fields.", _build_params({"data": PROP_DATA, "fields": {"type": "array", "description": "Fields to keep"}}), ["projection"], h_select_fields),
     ("Rename_Field", "Rename a field.", _build_params({"data": PROP_DATA, "field": PROP_FIELD, "new_name": PROP_FIELD}), ["projection"], h_rename_field),
     ("Drop_Fields", "Drop specified fields.", _build_params({"data": PROP_DATA, "fields": {"type": "array", "description": "Fields to drop"}}), ["projection"], h_drop_fields),
@@ -1128,11 +1149,11 @@ META_TOOL_SPECS = [
     ("Time_Overlap", "Compute overlap of two ranges.", _build_params({"range_a": PROP_TIME_RANGE, "range_b": PROP_TIME_RANGE}), ["time"], h_time_overlap),
     ("Merge_Touching_Ranges", "Merge overlapping/adjacent ranges.", _build_params({"ranges": {"type": "array", "description": "List of ranges"}}, {"tolerance": PROP_NUM}), ["time", "merge"], h_merge_touching),
     ("Align_Time_Buckets", "Align ranges to bucket size.", _build_params({"ranges": {"type": "array", "description": "List of ranges"}, "bucket": {"type": "number", "description": "Bucket size"}}), ["time"], h_align_time_buckets),
-    ("Clip_Time_Range", "Clip time range to bounds.", _build_params({"time_range": PROP_TIME_RANGE, "clip_start": PROP_NUM, "clip_end": PROP_NUM}), ["time"], h_clip_time_range),
+    ("Clip_Time_Range", "Intersect an existing absolute time-range record with supplied numeric bounds. Returns interval data only; does not clip, read, or inspect video/audio media.", _build_params({"time_range": PROP_TIME_RANGE, "clip_start": PROP_NUM, "clip_end": PROP_NUM}), ["time"], h_clip_time_range),
     ("Expand_Time_Range", "Expand time range by delta.", _build_params({"time_range": PROP_TIME_RANGE, "delta": PROP_NUM}), ["time"], h_expand_time_range),
     ("Shift_Time_Range", "Shift time range by offset.", _build_params({"time_range": PROP_TIME_RANGE, "offset": PROP_NUM}), ["time"], h_shift_time_range),
     ("Sort_Time_Ranges", "Sort ranges by start time.", _build_params({"ranges": {"type": "array", "description": "List of ranges"}}), ["time", "sort"], h_sort_time_ranges),
-    ("Window_Sliding", "Generate sliding windows.", _build_params({"data": PROP_DATA}, {"window": PROP_WINDOW}), ["window"], h_window_sliding),
+    ("Window_Sliding", "Partition an existing data list into overlapping sublists of window elements. Requires data already supplied or obtained from a previous tool result; window is an item count, not seconds. Does not sample frames or split raw video.", _build_params({"data": PROP_DATA}, {"window": PROP_WINDOW}), ["window"], h_window_sliding),
     ("Neighbor_List_Graph", "Get graph neighbors for a node from either an adjacency dict or a knowledge-graph payload.", _build_params({"graph": {"type": "object", "description": "Adjacency dict or knowledge-graph payload"}, "node": PROP_FIELD}, {"relation": PROP_FIELD, "include_metadata": {"type": "boolean", "description": "Return edge metadata instead of bare neighbor names", "default": False}}), ["graph"], h_neighbor_list),
     ("Degree_Count_Graph", "Count graph neighbors for a node, optionally restricted to one relation family.", _build_params({"graph": {"type": "object", "description": "Adjacency dict or knowledge-graph payload"}, "node": PROP_FIELD}, {"relation": PROP_FIELD}), ["graph"], h_degree_count),
     ("Edge_Filter_Graph", "Filter graph edges by allowed nodes and optional relation name.", _build_params({"graph": {"type": "object", "description": "Adjacency dict or knowledge-graph payload"}, "allowed": {"type": "array", "description": "Allowed nodes"}}, {"relation": PROP_FIELD}), ["graph"], h_edge_filter),

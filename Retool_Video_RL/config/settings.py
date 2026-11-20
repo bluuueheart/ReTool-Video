@@ -24,10 +24,13 @@ class Settings(BaseSettings):
     # System Configuration
     max_recursion_depth: int = 5
     max_iterations: int = 15
+    # Resolver budget counts model turns containing top-level Search, not all LLM calls.
+    # Multiple requests in one Search turn share one round; Actions/Return do not consume it.
     subagent_max_iterations: int = 3
     enable_streaming: bool = False
-    planner_max_generation_tokens: int = 8192
-    planner_min_thinking_generation_tokens: int = 8192
+    # Aligned with VAS: thinking + answer budget of the model-card thinking mode (vLLM serves 262144 tokens).
+    planner_max_generation_tokens: int = 24576
+    planner_min_thinking_generation_tokens: int = 24576
     subagent_max_generation_tokens: int = 2048
     planner_temperature: float = 1.0
     planner_top_p: float = 0.95
@@ -46,7 +49,7 @@ class Settings(BaseSettings):
     subagent_enable_thinking: bool = False
     graph_enable: bool = False
     web_search_enabled: bool = False
-    entity_track_enabled: bool = False
+    entity_track_enabled: bool = True
     disable_meta_tools: bool = False
     disabled_tool_names_base: Tuple[str, ...] = ()
     disabled_graph_tool_names: Tuple[str, ...] = (
@@ -146,7 +149,7 @@ class Settings(BaseSettings):
     non_planner_embedding_role_models: Dict[str, str] = {}
     # Preprocessing models are inference-only. Keep them off the RL actor CUDA
     # context unless explicitly changed here.
-    preprocess_asr_device: str = "cpu"
+    preprocess_asr_device: str = "cuda"
     per_device_max_memory_gb: Optional[float] = None
     planner_visual_observation_token_budget: int = 12288
     planner_visual_observation_image_token_estimate: int = 1536
@@ -169,8 +172,25 @@ class Settings(BaseSettings):
     video_clip_qa_processor_max_pixels: int = 65536 * 32 * 32
     video_clip_qa_max_frames: int = 80
     video_clip_qa_max_pixels: int = 768 * 32 * 32
-    video_clip_qa_max_new_tokens: int = 8192
+    # Compact JSON answer contract (aligned with VAS); a small cap stops verbose/looping reasoning.
+    video_clip_qa_max_new_tokens: int = 256
+    # Video_Clip_QA thinks by default (also for the first-round whole-video grounding QA); the thinking mode
+    # uses the model-card sampling and this thinking+answer output budget (same as the VAS whole-video view).
+    video_clip_qa_enable_thinking: bool = True
+    # Resolver review turn: on = delegated-request checklist (coverage/products/consistency); off = the original
+    # "Continue reasoning:".
+    resolver_review_checklist: bool = True
+    video_clip_qa_thinking_max_new_tokens: int = 24576
     video_clip_qa_think_max_chars: int = 4000
+    tool_reasoning_enabled: bool = True
+    tool_reasoning_max_new_tokens: int = 24576
+    perception_device: str = ""
+    perception_max_window_seconds: float = 120.0
+    perception_max_frames: int = 256
+    audio_qa_model_subpath: str = "Qwen/Qwen2.5-Omni-3B"
+    tracking_model_subpath: str = "facebook/sam2.1-hiera-tiny"
+    ocr_max_images: int = 16
+    diarization_python: str = ""
     
     # Multi-Device Configuration
     # NPU: Multi-device enabled by default (ensure HCCL environment is configured)

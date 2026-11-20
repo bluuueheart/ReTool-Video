@@ -1,4 +1,5 @@
 """Visual and audio analysis tools."""
+import contextlib
 import gc
 import hashlib
 import json
@@ -7,6 +8,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +19,7 @@ from config.settings import settings
 from preprocessing.video.frame_assets import export_video_subclip
 from runtime.session import runtime_session
 from toolkit.base import BaseTool, enrich_tool_result, summarize_tool_result
+from toolkit.time_utils import parse_time_seconds, annotate_indexed_segment_time
 from .visual_prompts import (
     build_video_clip_user_message,
     looks_like_truncated_video_clip_qa_answer,
@@ -256,33 +259,7 @@ def _coerce_numeric_scalar_or_list(name: str, value: Any) -> Any:
 
 
 def _parse_time_seconds(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    normalized_text = re.sub(
-        r"\s*(seconds?|secs?|sec|s)\s*$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-    if not normalized_text:
-        return None
-    try:
-        if ":" in normalized_text:
-            parts = [float(p) for p in normalized_text.split(":")]
-            if len(parts) == 3:
-                h, m, s = parts
-                return h * 3600 + m * 60 + s
-            if len(parts) == 2:
-                m, s = parts
-                return m * 60 + s
-        return float(normalized_text)
-    except Exception:
-        return None
+    return parse_time_seconds(value)
 
 
 def _parse_range(value: Any) -> Optional[Dict[str, float]]:
@@ -1570,6 +1547,169 @@ def _get_shared_video_clip_qa_visual_processor(model_path: str) -> Any:
         return None
 
 
+class WholeVideoTooLarge(RuntimeError):
+    """The server-side decode of the whole file would not fit in host memory."""
+
+    def __init__(self, message: str, size_bytes: float = 0.0, max_bytes: float = 0.0):
+        super().__init__(message)
+        self.size_bytes = float(size_bytes)
+        self.max_bytes = float(max_bytes)
+
+
+@contextlib.contextmanager
+def _big_decode_slot(video_path: Path):
+    """Keep the total host memory of concurrent whole-file decodes under a budget.
+
+    vLLM decodes every frame of a video file before sampling it, so a long 25-30 fps video needs hundreds of GB of
+    host memory; several at once exhaust the container. Each call reserves its decoded size in a cross-process ledger
+    (shared with the VAS runner when TMPDIR is the same) and waits until it fits under TOOLSTAR_DECODE_BUDGET_GB.
+    """
+    budget = float(os.environ.get("TOOLSTAR_DECODE_BUDGET_GB", "600")) * 1e9
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        size = (
+            float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            * float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            * float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            * 3.0
+        )
+        cap.release()
+    except Exception:  # noqa: BLE001
+        size = 0.0
+    if size <= 0:
+        yield
+        return
+    size *= float(os.environ.get("TOOLSTAR_DECODE_OVERHEAD", "1.3"))
+    max_gb = float(os.environ.get("TOOLSTAR_DECODE_MAX_GB", "900"))
+    if size > max_gb * 1e9:
+        raise WholeVideoTooLarge(
+            f"decoding {Path(video_path).name} needs ~{size / 1e9:.0f} GB, above the {max_gb:.0f} GB cap",
+            size_bytes=size,
+            max_bytes=max_gb * 1e9,
+        )
+    from filelock import FileLock
+
+    ledger_path = Path(
+        os.environ.get("TOOLSTAR_DECODE_LEDGER")
+        or Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "toolstar_decode_ledger.json"
+    )
+    lock = FileLock(str(ledger_path) + ".lock")
+    token = f"{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    reserved = False
+    while not reserved:
+        with lock:
+            try:
+                ledger = json.loads(ledger_path.read_text())
+            except Exception:  # noqa: BLE001
+                ledger = {}
+            ledger = {k: v for k, v in ledger.items() if _alive(int(k.split(":", 1)[0]))}
+            in_flight = sum(float(v) for v in ledger.values())
+            if not ledger or in_flight + size <= budget:
+                ledger[token] = size
+                ledger_path.write_text(json.dumps(ledger))
+                reserved = True
+        if not reserved:
+            time.sleep(3.0)
+    try:
+        yield
+    finally:
+        with lock:
+            try:
+                ledger = json.loads(ledger_path.read_text())
+            except Exception:  # noqa: BLE001
+                ledger = {}
+            ledger.pop(token, None)
+            ledger_path.write_text(json.dumps(ledger))
+
+
+def _video_duration_and_decode_bytes(video_path: Path) -> tuple[float, float]:
+    """(duration seconds, fully-decoded RGB bytes) of a video file; zeros when it cannot be probed."""
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        native_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        size = frames * float(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) * float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) * 3.0
+        cap.release()
+        duration = frames / native_fps if native_fps > 1e-3 else 0.0
+        return max(0.0, duration), max(0.0, size)
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0
+
+
+def _downsample_video_for_whole_qa(video_path: Path, target_fps: float) -> Optional[Path]:
+    """Re-encode a long video at ``target_fps`` and a bounded height so the server decodes only the frames it uses.
+
+    Used only when sampling the whole file at the requested fps would overflow the model context or the host decode
+    budget (e.g. 30-60 minute videos); the original path keeps the exact VAS-style server-side sampling. Cached by
+    (path, mtime, size, fps, height) and safe under concurrent workers.
+    """
+    from filelock import FileLock
+
+    from preprocessing.video.ffmpeg_audio import ffmpeg_binary
+
+    binary = ffmpeg_binary()
+    if not binary:
+        return None
+    height = int(os.environ.get("TOOLSTAR_VIDEO_QA_DOWNSAMPLE_HEIGHT", "480") or 480)
+    stat = video_path.stat()
+    key = hashlib.sha1(
+        f"{video_path}|{stat.st_mtime_ns}|{stat.st_size}|{target_fps:.4f}|{height}".encode("utf-8")
+    ).hexdigest()[:20]
+    cache_dir = Path(
+        os.environ.get("TOOLSTAR_VIDEO_QA_CACHE_DIR")
+        or Path(__file__).resolve().parents[3] / "local_runs" / "video_qa_cache"
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"{video_path.stem}_{key}.mp4"
+    with FileLock(str(out) + ".lock"):
+        if out.exists() and out.stat().st_size > 0:
+            return out
+        partial = out.with_name(f"{out.stem}.partial-{os.getpid()}.mp4")
+        command = [
+            binary, "-nostdin", "-y", "-v", "error", "-i", str(video_path), "-an",
+            "-vf", f"fps={target_fps:.4f},scale=-2:min(ih\\,{height})",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", str(partial),
+        ]
+        import subprocess
+
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
+            logger.warning("whole-video downsample failed for %s: %s", video_path, completed.stderr.strip()[-300:])
+            partial.unlink(missing_ok=True)
+            return None
+        os.replace(partial, out)
+    return out
+
+
+_CLIP_QA_REASONING = threading.local()
+
+
+def pop_last_clip_qa_reasoning() -> str:
+    """Thinking text of the last vLLM Video_Clip_QA on this thread (cleared on read)."""
+    value = str(getattr(_CLIP_QA_REASONING, "value", "") or "")
+    _CLIP_QA_REASONING.value = ""
+    return value
+
+
+def _video_clip_qa_thinking_enabled() -> bool:
+    raw = os.environ.get("TOOLSTAR_VIDEO_CLIP_QA_THINKING")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+    return bool(getattr(settings, "video_clip_qa_enable_thinking", True))
+
+
 def _answer_video_clip_qa_with_provider(
     *,
     clip_path: str,
@@ -1599,6 +1739,7 @@ def _answer_video_clip_qa_with_provider(
         1,
         int(getattr(settings, "video_clip_qa_max_frames", 80) or 80),
     )
+    _CLIP_QA_REASONING.sampling = {"requested_sampling_fps": official_sampling_fps}
     video_item: Dict[str, Any] = {
         "type": "video",
         "video": str(Path(clip_path).expanduser().resolve()),
@@ -1621,21 +1762,97 @@ def _answer_video_clip_qa_with_provider(
         video_item["max_pixels"] = max(floor_pixels, int(max_pixels))
 
     prompt_text = build_video_clip_user_message(query)
-    answer = provider.generate(
-        [
-            {
-                "role": "user",
-                "content": [
-                    video_item,
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ],
-        temperature=0.0,
-        max_tokens=int(max_new_tokens),
-        do_sample=False,
-        enable_thinking=False,
-    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                video_item,
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+    try:
+        from core.llm.vllm_provider import VLLMProvider
+
+        served_by_vllm = isinstance(provider, VLLMProvider)
+    except Exception:  # noqa: BLE001
+        served_by_vllm = False
+
+    if served_by_vllm:
+        # vLLM path (aligned with the VAS whole-video view): the file goes in as a video and the server samples it at
+        # `fps` (no client-side frame cap; the context is the server's 262144 tokens); thinking is on by default with
+        # the model-card thinking-mode sampling and the thinking+answer output budget.
+        video_item.pop("max_frames", None)
+        video_item["server_sampling"] = True
+        effective_fps = float(official_sampling_fps)
+        source_path = Path(clip_path).expanduser().resolve()
+        duration_s, decode_bytes = _video_duration_and_decode_bytes(source_path)
+        if duration_s > 0:
+            tokens_per_frame = float(os.environ.get("TOOLSTAR_VIDEO_TOKENS_PER_FRAME", "80") or 80)
+            input_budget = float(os.environ.get("TOOLSTAR_VIDEO_QA_INPUT_TOKEN_BUDGET", "228000") or 228000)
+            fps_for_budget = input_budget / (duration_s * tokens_per_frame)
+            decode_cap = float(os.environ.get("TOOLSTAR_DECODE_MAX_GB", "900")) * 1e9
+            decode_over = decode_bytes * float(os.environ.get("TOOLSTAR_DECODE_OVERHEAD", "1.3")) > decode_cap
+            if fps_for_budget < effective_fps or decode_over:
+                target_fps = max(0.05, min(effective_fps, fps_for_budget))
+                reduced = _downsample_video_for_whole_qa(source_path, target_fps)
+                if reduced is not None:
+                    logger.info(
+                        "Video_Clip_QA whole-video fallback: %s duration=%.0fs fps %.2f -> %.3f (context/decode budget), file=%s",
+                        source_path.name, duration_s, effective_fps, target_fps, reduced.name,
+                    )
+                    effective_fps = target_fps
+                    video_item["video"] = str(reduced)
+                    clip_path = str(reduced)
+        extra_body = {"mm_processor_kwargs": {"fps": float(effective_fps), "do_sample_frames": True}}
+        _CLIP_QA_REASONING.sampling.update(effective_sampling_fps=effective_fps, sampling_backend="vllm_server")
+        if _video_clip_qa_thinking_enabled():
+            call: Dict[str, Any] = dict(
+                temperature=1.0,
+                top_p=0.95,
+                top_k=20,
+                presence_penalty=1.5,
+                do_sample=True,
+                enable_thinking=True,
+                respect_role_generation_config=False,  # the qwen_vl role config would force thinking off
+                max_tokens=int(getattr(settings, "video_clip_qa_thinking_max_new_tokens", 24576) or 24576),
+            )
+        else:
+            call = dict(temperature=0.0, do_sample=False, enable_thinking=False, max_tokens=int(max_new_tokens))
+        logger.info(
+            "Video_Clip_QA vLLM request: input=video(server_sampling) file=%s server_fps=%.3f thinking=%s max_tokens=%s "
+            "temperature=%s presence_penalty=%s",
+            Path(str(video_item["video"])).name,
+            effective_fps,
+            bool(call.get("enable_thinking")),
+            call.get("max_tokens"),
+            call.get("temperature"),
+            call.get("presence_penalty", 0.0),
+        )
+        _CLIP_QA_REASONING.value = ""
+        with _big_decode_slot(Path(clip_path)):
+            answer = provider.generate(messages, extra_body=extra_body, **call)
+        try:
+            from core.llm.vllm_provider import pop_last_reasoning
+
+            _CLIP_QA_REASONING.value = pop_last_reasoning()
+        except Exception:  # noqa: BLE001
+            _CLIP_QA_REASONING.value = ""
+        answer = re.sub(r"^.*?</think>", "", str(answer or ""), flags=re.S)
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S)
+    else:
+        from core.llm.response_metadata import clear_response_reasoning, take_response_reasoning
+        clear_response_reasoning()
+        thinking = _video_clip_qa_thinking_enabled()
+        answer = provider.generate(
+            messages,
+            temperature=0.0,
+            max_tokens=int(settings.video_clip_qa_thinking_max_new_tokens if thinking else max_new_tokens),
+            do_sample=False,
+            enable_thinking=thinking,
+            respect_role_generation_config=False,
+        )
+        _CLIP_QA_REASONING.value = take_response_reasoning()
     raw_answer = str(answer or "").strip()
     if raw_answer:
         logger.info("[Video_Clip_QA][RAW_RESPONSE_BEGIN][backend=planner_provider_video]\n%s\n[Video_Clip_QA][RAW_RESPONSE_END]", raw_answer)
@@ -1752,9 +1969,15 @@ def _finalize_video_clip_qa_answer(raw_answer: Any, *, backend: str) -> Dict[str
         "answer": normalized["planner_text"],
         "backend": backend,
         "parsed_json": normalized["parsed_json"],
+        "reasoning": "\n\n".join(re.findall(r"<think\b[^>]*>(.*?)</think>", str(raw_answer or ""), flags=re.S | re.I)).strip(),
     }
     parsed_json = normalized.get("parsed_json")
     if isinstance(parsed_json, dict):
+        # Expose model-declared records for pointer-based composition without inventing events.
+        for field in ("events", "records", "observations", "tracks"):
+            if field in parsed_json:
+                result[field] = parsed_json[field]
+                result["structured_output_source"] = "model_generated_unverified"
         if "answer" in parsed_json:
             result["answer_value"] = parsed_json["answer"]
         if "evidence" in parsed_json:
@@ -1818,6 +2041,9 @@ def _run_video_clip_qa(
     query: str,
     model_path: str,
 ) -> Dict[str, Any]:
+    # Capture reasoning in the returned payload for every caller, on this thread.
+    pop_last_clip_qa_reasoning()
+    _CLIP_QA_REASONING.sampling = {}
     clip_path = _persist_probe_video_clip(
         video_path=video_path,
         start=start,
@@ -1842,8 +2068,9 @@ def _run_video_clip_qa(
             max_pixels=effective_max_pixels,
         ):
             try:
+                pop_last_clip_qa_reasoning()
                 logger.info(
-                    "Video_Clip_QA direct clip attempt=%s model_sampling_fps=%s model_max_frames=%s model_min_pixels=%s model_max_pixels=%s do_sample_frames=True max_new_tokens=%s clip=%s",
+                    "Video_Clip_QA direct clip attempt=%s (HF-path plan: fps=%s max_frames=%s min_pixels=%s max_pixels=%s max_new_tokens=%s; the vLLM path ignores these and logs its real request next) clip=%s",
                     plan["label"],
                     official_sampling_fps,
                     official_max_frames,
@@ -1902,6 +2129,13 @@ def _run_video_clip_qa(
             raw_answer_text,
             backend="planner_provider_video",
         )
+        result["reasoning"] = pop_last_clip_qa_reasoning() or result["reasoning"]
+        result.update(getattr(_CLIP_QA_REASONING, "sampling", {}))
+        result["requested_window_seconds"] = round(float(end) - float(start), 6)
+        sampling_fps = result.get("effective_sampling_fps") or result.get("requested_sampling_fps") or official_sampling_fps
+        if 0 < result["requested_window_seconds"] < 1.0 / float(sampling_fps):
+            result["warning"] = _merge_warning_messages(result.get("warning"),
+                "Requested clip is shorter than one sampling interval. This result does not establish motion or temporal order; request a wider window or use Inspect_Frame for static appearance.")
         result["clip_path"] = clip_path
         if plan_warning:
             existing_warning = str(result.get("warning", "") or "").strip()
@@ -2739,21 +2973,25 @@ def _resolve_image_path(image: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _normalize_xywh_region(region: List[float], image_width: int, image_height: int) -> tuple[int, int, int, int]:
+def _normalize_xywh_region(region: List[float], image_width: int, image_height: int, coordinate_space: str = "auto") -> tuple[int, int, int, int]:
     if len(region) != 4:
         raise ValueError("Region must be [x, y, width, height].")
 
     x, y, width, height = [float(value) for value in region]
-    if max(abs(x), abs(y), abs(width), abs(height)) <= 1.0:
+    if not all(math.isfinite(v) for v in (x, y, width, height)) or width <= 0 or height <= 0:
+        raise ValueError("Region must have finite coordinates and positive width/height.")
+    if coordinate_space not in {"auto", "pixels", "normalized"}:
+        raise ValueError("coordinate_space must be auto, pixels or normalized.")
+    if coordinate_space == "normalized" or (coordinate_space == "auto" and max(abs(x), abs(y), abs(width), abs(height)) <= 1.0):
         x *= image_width
         y *= image_height
         width *= image_width
         height *= image_height
 
-    left = max(0, min(image_width - 1, int(math.floor(x))))
-    top = max(0, min(image_height - 1, int(math.floor(y))))
-    right = max(left + 1, min(image_width, int(math.ceil(x + width))))
-    bottom = max(top + 1, min(image_height, int(math.ceil(y + height))))
+    left = max(0, int(math.floor(x)))
+    top = max(0, int(math.floor(y)))
+    right = min(image_width, int(math.ceil(x + width)))
+    bottom = min(image_height, int(math.ceil(y + height)))
 
     if right <= left or bottom <= top:
         raise ValueError("Region resolves to an empty crop.")
@@ -2771,8 +3009,9 @@ def _persist_transformed_image(
 ) -> Dict[str, Any]:
     resolved_source = Path(source_path).expanduser().resolve()
     source_images = source_images or [str(resolved_source)]
+    source_stat = resolved_source.stat()
     signature = hashlib.sha1(
-        f"{tool_name}|{resolved_source}|{signature_payload}".encode("utf-8")
+        f"{tool_name}|{resolved_source}|{source_stat.st_size}|{source_stat.st_mtime_ns}|{signature_payload}".encode("utf-8")
     ).hexdigest()[:12]
     output_dir = _resolve_visual_observation_root() / resolved_source.stem / f"{tool_name}_{signature}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2796,7 +3035,7 @@ def _persist_transformed_image(
 
 def _build_matched_segments(rows: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
     return [
-        {
+        annotate_indexed_segment_time({
             "video": row.get("video"),
             "segment_id": row.get("segment_id"),
             "segment_ref": row.get("segment_ref") or f"{row.get('video')}_{row.get('segment_id')}",
@@ -2808,9 +3047,49 @@ def _build_matched_segments(rows: List[Dict[str, Any]], limit: int = 5) -> List[
                 f"Segment {row.get('segment_id')} at {row.get('time')}: "
                 f"{row.get('caption', '') or row.get('transcript', '') or row.get('ocr', '')}"
             ).strip(),
-        }
+        }, source="preprocessed_segment_index")
         for row in rows[:limit]
     ]
+
+
+def _run_visual_task(query, time_range=None, video_path=None, **kwargs):
+    from toolkit.perception_backends import resolve_video, resolve_window
+    probes = _normalize_time_range_probes(time_range)
+    if len(probes) > 1:
+        return _build_batch_result("Visual_Model_Task", [
+            _run_visual_task(query, time_range=probe, video_path=video_path, **kwargs) for probe in probes])
+    try:
+        video = resolve_video(video_path or kwargs.get("video"))
+        start, end = resolve_window(video, probes[0] if probes else time_range)
+        result = VideoClipQA().run(start_time=start, end_time=end, query=query, video_path=video)
+        result.update(independent_model=False, input_modalities=["video_frames"],
+                      model_timestamp_basis="clip_relative_unverified", timestamp_offset_seconds=start,
+                      model_forward_executed=bool(result.get("answer")))
+        return result
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "result": f"Raw visual inference failed: {exc}"}
+
+
+def _run_perception_probes(name, operation, time_range=None, **kwargs):
+    from toolkit.perception_backends import run_backend
+    probes = _normalize_time_range_probes(time_range)
+    if len(probes) <= 1:
+        return run_backend(operation, time_range=probes[0] if probes else time_range, **kwargs)
+    return _build_batch_result(name, [run_backend(operation, time_range=probe, **kwargs) for probe in probes])
+
+
+class AudioClipQA(BaseTool):
+    name: str = "Audio_Clip_QA"
+    description: str = "Answer questions using raw audio, optionally with video frames. Returns full model response, available reasoning, evidence and absolute clip bounds. No ASR-keyword proxy."
+    tags: list = ["base", "audio", "video", "qa"]
+    parameters: Dict[str, Any] = {"type": "object", "properties": {
+        "query": {"type": "string"}, "video_path": {"type": "string"},
+        "start_time": {"type": "number"}, "end_time": {"type": "number"},
+        "include_video": {"type": "boolean", "default": True}}, "required": ["query", "start_time", "end_time"]}
+
+    def run(self, query, start_time, end_time, video_path=None, include_video=True, **kwargs):
+        from toolkit.perception_backends import run_backend
+        return run_backend("audio_qa", video_path=video_path, time_range=[start_time, end_time], query=query, include_video=include_video)
 
 
 class EntityTrack(BaseTool):
@@ -2818,11 +3097,11 @@ class EntityTrack(BaseTool):
     
     name: str = "Entity_Track"
     description: str = (
-        "Generate continuous trajectories for specific visual objects across the video timeline. "
-        "Input object description, output all start-end time segments and corresponding IDs, "
-        "establishing inter-frame associations."
+        "Detect targets periodically in raw frames with Grounding DINO and propagate masks with SAM2. "
+        "Includes targets entering later and flags uncertain identities after loss or ambiguous association. "
+        "Returns per-frame IDs/boxes and loss flags within a bounded clip. IDs are not guaranteed through full occlusion."
     )
-    tags: list = ["base", "visual", "tracking", "weak_proxy"]
+    tags: list = ["base", "visual", "tracking"]
     
     @property
     def model_path(self) -> str:
@@ -2843,112 +3122,21 @@ class EntityTrack(BaseTool):
             "confidence_threshold": {
                 "type": "number",
                 "description": "Minimum confidence score for detections",
-                "default": 0.7
-            }
+                "default": 0.3
+            },
+            "video_path": {"type": ["string", "null"], "default": None, "description": "Raw source video; omitted or null uses the active video"},
+            "initial_boxes": {"type": ["array", "null"], "default": None, "description": "Optional initial target boxes in absolute pixel xyxy coordinates; null enables automatic detection"},
+            "redetect_interval_seconds": {"type": "number", "default": 1.0, "description": "Period between detections, in (0, 10] seconds"}
         },
         "required": ["visual_object_description"]
     }
     
-    def run(
-        self,
-        visual_object_description: str,
-        time_range: Any = None,
-        confidence_threshold: float = 0.7,
-        **kwargs,
-    ) -> Any:
-        """Execute entity tracking.
-        
-        Args:
-            visual_object_description: Object to track
-            confidence_threshold: Minimum confidence
-            **kwargs: Additional arguments
-            
-        Returns:
-            List of tracking results with time segments and IDs
-        """
-        rows = _iter_processed_segments(kwargs.get("video") or kwargs.get("video_path"))
-
-        def _run_single(range_value: Any) -> Dict[str, Any]:
-            target = _parse_range(range_value)
-            ranked_rows = _select_relevant_rows(
-                rows,
-                target_range=target,
-                query=visual_object_description,
-                video_hint=kwargs.get("video") or kwargs.get("video_path"),
-            )
-
-            matched_rows: List[Dict[str, Any]] = []
-            for row in ranked_rows:
-                score = max(
-                    _match_score(row.get("caption", ""), visual_object_description),
-                    _match_score(row.get("ocr", ""), visual_object_description),
-                    _match_score(row.get("text", ""), visual_object_description),
-                )
-                if score <= 0:
-                    continue
-                confidence = min(0.99, 0.55 + score * 0.45)
-                if confidence < confidence_threshold:
-                    continue
-                enriched_row = dict(row)
-                enriched_row["_match_confidence"] = confidence
-                matched_rows.append(enriched_row)
-
-            evidence = _collect_visual_probe_evidence(
-                rows=rows,
-                query=visual_object_description,
-                target_range=target or _merge_row_ranges(matched_rows, limit=3),
-                video_hint=kwargs.get("video") or kwargs.get("video_path"),
-                mode="entity_track",
-                sample_cap=8,
-            )
-            if evidence.get("error"):
-                return enrich_tool_result(
-                    _build_planner_visual_result(
-                        image_evidence=[],
-                        status="error",
-                        fallback_message=str(evidence.get("error")),
-                        extra_fields={
-                            "description": visual_object_description,
-                            "confidence_threshold": confidence_threshold,
-                        },
-                    ),
-                    tool_name=self.name,
-                )
-            occurrences = _build_temporal_occurrences(
-                matched_rows,
-                label=visual_object_description,
-                confidence_threshold=confidence_threshold,
-                limit=8,
-            )
-            probe_label = _probe_label(range_value)
-            status = "success" if occurrences or evidence["image_evidence"] else "no_valid_result"
-            return enrich_tool_result(
-                _build_planner_visual_result(
-                    image_evidence=evidence.get("image_evidence") or [],
-                    image_stats=evidence,
-                    status=status,
-                    fallback_message=(
-                        f"Entity_Track did not find usable image evidence for "
-                        f"'{visual_object_description}' in {probe_label}."
-                    ),
-                    extra_fields={
-                        "description": visual_object_description,
-                        "confidence_threshold": confidence_threshold,
-                        "occurrences": occurrences,
-                        "items": occurrences,
-                        "first_seen": occurrences[0]["time"] if occurrences else None,
-                        "last_seen": occurrences[-1]["time"] if occurrences else None,
-                    },
-                    warning=evidence.get("warning"),
-                ),
-                tool_name=self.name,
-            )
-
-        probes = _normalize_time_range_probes(time_range)
-        logger.info(f"Entity_Track: Tracking '{visual_object_description}' using {self.model_path}")
-        if len(probes) <= 1:
-            return _run_single(probes[0] if probes else time_range)
-        return _build_batch_result(self.name, [_run_single(probe) for probe in probes])
+    def run(self, visual_object_description: str, time_range: Any = None,
+            confidence_threshold: float = 0.3, initial_boxes=None, **kwargs) -> Any:
+        return _run_perception_probes(self.name, "entity_track", video_path=kwargs.get("video_path") or kwargs.get("video"),
+            time_range=time_range, description=visual_object_description,
+            threshold=confidence_threshold, initial_boxes=initial_boxes,
+            redetect_interval_seconds=kwargs.get("redetect_interval_seconds", 1.0))
 
 
 class AudioEventDetect(BaseTool):
@@ -2956,12 +3144,9 @@ class AudioEventDetect(BaseTool):
     
     name: str = "Audio_Event_Detect"
     description: str = (
-        "Identify non-speech environmental audio events. "
-        "Input sound description (e.g., 'explosion', 'siren', 'piano music'), "
-        "output accurate time segments where the sound occurs, "
-        "supplementing information not covered by ASR captions."
+        "Score raw audio windows against a sound description with CLAP. Returns candidate intervals and uncalibrated similarity scores, not exact onsets or probabilities."
     )
-    tags: list = ["base", "audio", "detection", "weak_proxy"]
+    tags: list = ["base", "audio", "detection"]
     
     @property
     def model_path(self) -> str:
@@ -2970,6 +3155,7 @@ class AudioEventDetect(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "video_path": {"type": ["string", "null"], "default": None, "description": "Raw source video; omitted or null uses the active video"},
             "sound_description": {
                 "type": "string",
                 "description": "Description of sound to detect"
@@ -2984,69 +3170,54 @@ class AudioEventDetect(BaseTool):
     }
     
     def run(self, sound_description: str, time_range: Any = None, **kwargs) -> Any:
-        """Execute audio event detection.
-        
-        Args:
-            sound_description: Sound to detect
-            time_range: Optional time constraint
-            **kwargs: Additional arguments
-            
-        Returns:
-            List of detected audio events with timestamps
-        """
-        rows = _iter_processed_segments()
+        return _run_perception_probes(self.name, "audio_events", video_path=kwargs.get("video_path") or kwargs.get("video"),
+                           time_range=time_range, description=sound_description)
 
-        def _run_single(range_value: Any) -> Dict[str, Any]:
-            target = _parse_range(range_value)
-            probe_label = _probe_label(range_value)
-            results: List[Dict[str, Any]] = []
-            for row in rows:
-                if not _overlap(row.get("time_parsed"), target):
-                    continue
-                score = _match_score(row["transcript"], sound_description)
-                if score <= 0:
-                    continue
-                rng = row.get("time_parsed")
-                timestamp_value = int((rng["start"] + rng["end"]) / 2) if rng else None
-                results.append(
-                    {
-                        "event": sound_description,
-                        "timestamp": timestamp_value,
-                        "time": row["time"],
-                        "video": row["video"],
-                        "segment_id": row["segment_id"],
-                        "confidence": round(min(0.99, 0.5 + score * 0.5), 4),
-                        "time_range": probe_label,
-                    }
-                )
-            results.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
-            return {
-                "probe_label": probe_label,
-                "time_range": probe_label,
-                "items": results,
-                "result": summarize_tool_result(results, tool_name=self.name),
-            }
 
-        ranges = _normalize_time_range_probes(time_range)
-        if len(ranges) <= 1:
-            result = _run_single(ranges[0] if ranges else time_range)
-            logger.info(f"Audio_Event_Detect: Detecting '{sound_description}' using {self.model_path}")
-            return result["items"]
-
-        probes = [_run_single(range_value) for range_value in ranges]
-        logger.info(f"Audio_Event_Detect: Detecting '{sound_description}' using {self.model_path}")
-        return _build_batch_result(self.name, probes)
+def _existing_image_evidence(image_path: str, tool_name: str) -> Dict[str, Any]:
+    # observation IDs denote recorded evidence, not filenames. Preserve all images
+    # in the referenced result instead of guessing a frame or resampling the video.
+    recorded = runtime_session.get_tool_results().get(str(image_path))
+    if recorded is not None:
+        result = recorded.get("result")
+        images = []
+        def collect(value):
+            if isinstance(value, dict):
+                for item in value.get("image_evidence", []) or []:
+                    if isinstance(item, dict) and item.get("image") and item not in images:
+                        images.append(dict(item))
+                for key in ("items", "probes", "executed_results", "result", "observation_payload"):
+                    collect(value.get(key))
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+        collect(result)
+        images = [item for item in images if _is_readable_image(Path(item["image"]))]
+        if not images:
+            raise ValueError(f"{tool_name}: evidence {image_path!r} contains no readable image; supply an image or a time probe.")
+        return _build_planner_visual_result(image_evidence=images, status="success",
+            fallback_message="Existing recorded image evidence returned; inspect all attached images.",
+            extra_fields={"source_evidence_id": image_path, "reused_image": True})
+    image = _persist_standardized_single_image(image_path)
+    if image is None:
+        raise FileNotFoundError(f"{tool_name} could not read image_path: {image_path}")
+    return _build_planner_visual_result(
+        image_evidence=[image], status="success",
+        fallback_message="Existing image evidence returned; inspect the attached image.",
+        extra_fields={"image_path": str(Path(image_path).expanduser().resolve()), "reused_image": True},
+    )
 
 
 class OCRExtract(BaseTool):
-    """Return direct frame evidence for OCR-style inspection."""
+    """Recognize visible text and retain the underlying image evidence."""
     
     name: str = "OCR_Extract"
     description: str = (
         "Return direct frame evidence for OCR-style inspection of visible text. "
         "Targets embedded text beyond caption streams (e.g., road signs, screen content, banners) "
         "so the planner can read exact on-screen numbers or labels from the returned images. "
-        "This tool does not run a separate OCR model in the middle; it only samples and returns frames. "
+        "Runs local OCR detection/recognition and returns text, confidence and source-image pixel polygons. "
+        "Use backend='frames' for image-only inspection; recognition errors are reported explicitly. "
         "`density` must be numeric seconds per frame."
     )
     tags: list = ["base", "ocr", "visual"]
@@ -3054,6 +3225,8 @@ class OCRExtract(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "image_path": {"type": ["string", "null"], "description": "Existing evidence image to return directly without resampling"},
+            "backend": {"type": "string", "enum": ["rapidocr", "frames"], "default": "rapidocr", "description": "Text recognition or image-only evidence"},
             "image_region": {
                 "type": ["string", "number", "array", "null"],
                 "description": "Single timestamp/range or a list of timestamps/ranges to extract text from",
@@ -3100,7 +3273,7 @@ class OCRExtract(BaseTool):
         has_timestamp = timestamp not in (None, "", [], {})
         has_time_window = t_start not in (None, "", [], {}) and t_end not in (None, "", [], {})
 
-        if not (has_image_region or has_timestamp or has_time_window):
+        if not (kwargs.get("image_path") or has_image_region or has_timestamp or has_time_window):
             raise ValueError("OCR_Extract requires image_region, timestamp, or both t_start and t_end.")
         _coerce_numeric_scalar_or_list("density", density)
         return True
@@ -3125,6 +3298,11 @@ class OCRExtract(BaseTool):
         Returns:
             Image evidence and timestamps for downstream OCR reading
         """
+        from toolkit.ocr_backend import recognize_images
+        def recognize(result):
+            return recognize_images(result, backend=kwargs.get("backend", "rapidocr"), language=language)
+        if kwargs.get("image_path"):
+            return recognize(_existing_image_evidence(kwargs["image_path"], self.name))
         rows = _iter_processed_segments()
         specs = _build_visual_probe_specs(
             timestamp=timestamp if timestamp is not None else kwargs.get("timestamp"),
@@ -3253,6 +3431,7 @@ class OCRExtract(BaseTool):
             for spec in specs
         ]
         logger.info("OCR_Extract probes=%s", ", ".join(probe_labels))
+        probe_results = [recognize(result) for result in probe_results]
         return probe_results[0] if len(probe_results) == 1 else _build_batch_result(self.name, probe_results)
 
 
@@ -3261,10 +3440,9 @@ class SpeakerDiarization(BaseTool):
     
     name: str = "Speaker_Diarization"
     description: str = (
-        "Speaker separation and identification. "
-        "Input audio segment, output 'who (Speaker A/B/C) spoke during which time segments'."
+        "Separate anonymous speakers from raw audio using a local pyannote checkpoint. Returns timed speech turns. Missing weights/dependencies return backend_unavailable; no synthetic speaker labels."
     )
-    tags: list = ["base", "audio", "speaker", "debug_placeholder"]
+    tags: list = ["base", "audio", "speaker", "backend_required"]
     
     @property
     def model_path(self) -> str:
@@ -3273,6 +3451,7 @@ class SpeakerDiarization(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "video_path": {"type": ["string", "null"], "default": None, "description": "Raw source video; omitted or null uses the active video"},
             "audio_segment": {
                 "type": ["string", "array"],
                 "description": "Audio segment identifier/time range, or a list of them"
@@ -3282,51 +3461,8 @@ class SpeakerDiarization(BaseTool):
     }
     
     def run(self, audio_segment: Any, **kwargs) -> Any:
-        """Execute speaker diarization.
-        
-        Args:
-            audio_segment: Audio segment to analyze
-            **kwargs: Additional arguments
-            
-        Returns:
-            Speaker timeline information
-        """
-        rows = _iter_processed_segments()
-
-        def _run_single(segment_value: Any) -> Dict[str, Any]:
-            target = _parse_range(segment_value)
-            candidates = [r for r in rows if _overlap(r.get("time_parsed"), target)]
-            speakers = ["Speaker_A", "Speaker_B", "Speaker_C"]
-            results: List[Dict[str, Any]] = []
-            for idx, row in enumerate(candidates[:6]):
-                speaker = speakers[idx % len(speakers)]
-                token_count = len(_tokenize(row.get("transcript", "")))
-                conf = round(min(0.98, 0.55 + min(token_count, 30) / 100), 4)
-                results.append(
-                    {
-                        "speaker": speaker,
-                        "time": row.get("time"),
-                        "video": row.get("video"),
-                        "segment_id": row.get("segment_id"),
-                        "confidence": conf,
-                    }
-                )
-            return {
-                "probe_label": str(segment_value),
-                "audio_segment": segment_value,
-                "items": results,
-                "result": summarize_tool_result(results, tool_name=self.name),
-            }
-
-        segments = _normalize_time_range_probes(audio_segment)
-        if len(segments) <= 1:
-            result = _run_single(segments[0] if segments else audio_segment)
-            logger.info(f"Speaker_Diarization for segment: {audio_segment} using {self.model_path}")
-            return result["items"]
-
-        probes = [_run_single(segment_value) for segment_value in segments]
-        logger.info(f"Speaker_Diarization for segment: {audio_segment} using {self.model_path}")
-        return _build_batch_result(self.name, probes)
+        return _run_perception_probes(self.name, "diarize", video_path=kwargs.get("video_path") or kwargs.get("video"),
+                           time_range=audio_segment)
 
 
 class EmotionAnalysis(BaseTool):
@@ -3334,8 +3470,7 @@ class EmotionAnalysis(BaseTool):
     
     name: str = "Emotion_Analysis"
     description: str = (
-        "Emotion analysis combining facial expressions, body language, and voice tone. "
-        "Determine emotional states (anger, tension, happiness) and scene atmosphere."
+        "Use raw audio/video model inference to describe expressions, body language and vocal tone. Returns observed cues, reasoning and uncertain emotion interpretations, not a clinical or calibrated emotion label."
     )
     tags: list = ["base", "visual", "audio", "emotion"]
     
@@ -3350,6 +3485,7 @@ class EmotionAnalysis(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "video_path": {"type": ["string", "null"], "default": None, "description": "Raw source video; omitted or null uses the active video"},
             "video_clip": {
                 "type": ["string", "array"],
                 "description": "Video clip identifier/time range, or a list of them"
@@ -3365,89 +3501,14 @@ class EmotionAnalysis(BaseTool):
     }
     
     def run(self, video_clip: Any, modality: List[str] = None, **kwargs) -> Any:
-        """Execute emotion analysis.
-        
-        Args:
-            video_clip: Video clip to analyze
-            modality: Modalities to use
-            **kwargs: Additional arguments
-            
-        Returns:
-            Emotion analysis results
-        """
-        modality = modality or ["face", "voice"]
-        rows = _iter_processed_segments()
-
-        def _run_single(clip_value: Any) -> Dict[str, Any]:
-            target = _parse_range(clip_value)
-            candidates = [r for r in rows if _overlap(r.get("time_parsed"), target)]
-            text = " ".join(r.get("text", "") for r in candidates).lower()
-
-            anger_keys = ["argue", "shout", "fight", "angry", "yell", "conflict"]
-            happy_keys = ["smile", "laugh", "happy", "cheer", "celebrate"]
-            tense_keys = ["tense", "panic", "rush", "alarm", "urgent", "warning", "police"]
-
-            anger = sum(text.count(k) for k in anger_keys)
-            happy = sum(text.count(k) for k in happy_keys)
-            tension = sum(text.count(k) for k in tense_keys)
-            total = max(1, anger + happy + tension)
-            scores = {
-                "anger": round(anger / total, 4),
-                "tension": round(tension / total, 4),
-                "happiness": round(happy / total, 4),
-            }
-            dominant = max(scores, key=scores.get)
-            evidence = _collect_visual_probe_evidence(
-                rows=rows,
-                query="emotion analysis " + " ".join(modality),
-                target_range=target or _merge_row_ranges(candidates, limit=3),
-                video_hint=kwargs.get("video") or kwargs.get("video_path"),
-                mode="emotion_analysis",
-                sample_cap=8,
-            )
-            if evidence.get("error"):
-                return enrich_tool_result(
-                    _build_planner_visual_result(
-                        image_evidence=[],
-                        status="error",
-                        fallback_message=str(evidence.get("error")),
-                        extra_fields={
-                            "modalities_analyzed": modality,
-                        },
-                    ),
-                    tool_name=self.name,
-                )
-            status = "success" if evidence["image_evidence"] else "no_valid_result"
-            return enrich_tool_result(
-                _build_planner_visual_result(
-                    image_evidence=evidence.get("image_evidence") or [],
-                    image_stats=evidence,
-                    status=status,
-                    fallback_message=f"Emotion_Analysis did not provide usable image evidence for {clip_value}.",
-                    extra_fields={
-                        "modalities_analyzed": modality,
-                        "dominant_emotion": dominant,
-                        "emotion_scores": scores,
-                        "confidence": (
-                            round(0.5 + scores[dominant] * 0.5, 4)
-                            if evidence["image_evidence"]
-                            else 0.0
-                        ),
-                    },
-                    warning=evidence.get("warning"),
-                ),
-                tool_name=self.name,
-            )
-
-        clips = _normalize_time_range_probes(video_clip)
-        if len(clips) <= 1:
-            result = _run_single(clips[0] if clips else video_clip)
-            logger.info(f"Emotion_Analysis for clip: {video_clip}")
-            return result
-
-        probes = [_run_single(clip_value) for clip_value in clips]
-        logger.info(f"Emotion_Analysis for clip: {video_clip}")
-        return _build_batch_result(self.name, probes)
+        modalities = modality or ["face", "voice"]
+        query = ("Assess visible expressions/body language and audible vocal tone for this clip. "
+                 "Separate observed cues from uncertain emotion interpretations; return unknown when evidence is insufficient. "
+                 f"Requested modalities: {modalities}.")
+        if "voice" in modalities:
+            return _run_perception_probes(self.name, "audio_qa", video_path=kwargs.get("video_path") or kwargs.get("video"),
+                time_range=video_clip, query=query, include_video=bool(set(modalities) & {"face", "body"}))
+        return _run_visual_task(query, time_range=video_clip, **kwargs)
 
 
 class ActionRecognition(BaseTool):
@@ -3457,7 +3518,7 @@ class ActionRecognition(BaseTool):
     description: str = (
         "Identify action categories in video (e.g., 'running', 'handshake', 'fighting', 'cooking')."
     )
-    tags: list = ["base", "visual", "action", "weak_proxy"]
+    tags: list = ["base", "visual", "action"]
     
     @property
     def model_path(self) -> str:
@@ -3466,6 +3527,7 @@ class ActionRecognition(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "video_path": {"type": ["string", "null"], "default": None, "description": "Raw source video; omitted or null uses the active video"},
             "action_description": {
                 "type": "string",
                 "description": "Description of action to recognize"
@@ -3480,100 +3542,10 @@ class ActionRecognition(BaseTool):
     }
     
     def run(self, action_description: str, time_range: Any = None, **kwargs) -> Any:
-        """Execute action recognition.
-        
-        Args:
-            action_description: Action to recognize
-            time_range: Optional time constraint
-            **kwargs: Additional arguments
-            
-        Returns:
-            List of recognized actions with timestamps
-        """
-        rows = _iter_processed_segments(kwargs.get("video") or kwargs.get("video_path"))
-
-        def _run_single(range_value: Any) -> Dict[str, Any]:
-            target = _parse_range(range_value)
-            probe_label = _probe_label(range_value)
-            ranked_rows = _select_relevant_rows(
-                rows,
-                target_range=target,
-                query=action_description,
-                video_hint=kwargs.get("video") or kwargs.get("video_path"),
-            )
-
-            occurrences: List[Dict[str, Any]] = []
-            matched_rows: List[Dict[str, Any]] = []
-            for row in ranked_rows:
-                score = max(
-                    _match_score(row.get("caption", ""), action_description),
-                    _match_score(row.get("text", ""), action_description),
-                )
-                if score <= 0:
-                    continue
-                confidence = round(min(0.99, 0.5 + score * 0.5), 4)
-                enriched_row = dict(row)
-                enriched_row["_match_confidence"] = confidence
-                matched_rows.append(enriched_row)
-                occurrences.append(
-                    {
-                        "action": action_description,
-                        "time": row.get("time"),
-                        "video": row.get("video"),
-                        "segment_id": row.get("segment_id"),
-                        "segment_ref": row.get("segment_ref"),
-                        "confidence": confidence,
-                        "sample_timestamps": list(row.get("frame_times") or [])[:4],
-                        "time_range_searched": probe_label,
-                    }
-                )
-
-            evidence = _collect_visual_probe_evidence(
-                rows=rows,
-                query=action_description,
-                target_range=target or _merge_row_ranges(matched_rows, limit=3),
-                video_hint=kwargs.get("video") or kwargs.get("video_path"),
-                mode="action_recognition",
-                sample_cap=8,
-            )
-            if evidence.get("error"):
-                return enrich_tool_result(
-                    _build_planner_visual_result(
-                        image_evidence=[],
-                        status="error",
-                        fallback_message=str(evidence.get("error")),
-                        extra_fields={
-                            "action_description": action_description,
-                        },
-                    ),
-                    tool_name=self.name,
-                )
-            status = "success" if occurrences or evidence["image_evidence"] else "no_valid_result"
-            return enrich_tool_result(
-                _build_planner_visual_result(
-                    image_evidence=evidence.get("image_evidence") or [],
-                    image_stats=evidence,
-                    status=status,
-                    fallback_message=(
-                        f"Action_Recognition did not find usable image evidence for "
-                        f"'{action_description}' in {probe_label}."
-                    ),
-                    extra_fields={
-                        "action_description": action_description,
-                        "items": occurrences,
-                        "occurrences": occurrences,
-                    },
-                    warning=evidence.get("warning"),
-                ),
-                tool_name=self.name,
-            )
-
-        ranges = _normalize_time_range_probes(time_range)
-        logger.info(f"Action_Recognition: '{action_description}' using {self.model_path}")
-        if len(ranges) <= 1:
-            return _run_single(ranges[0] if ranges else time_range)
-
-        return _build_batch_result(self.name, [_run_single(range_value) for range_value in ranges])
+        query = (f"Locate and describe occurrences of this action in the raw clip: {action_description}. "
+                 "Return JSON with answer, reasoning, evidence intervals, and uncertainty. "
+                 "Do not infer actions from captions or transcript mentions alone. Times refer to this clip unless explicitly converted.")
+        return _run_visual_task(query, time_range=time_range, **kwargs)
 
 
 class VideoClipQA(BaseTool):
@@ -3603,7 +3575,7 @@ class VideoClipQA(BaseTool):
             },
             "end_time": {
                 "type": ["string", "number"],
-                "description": "Clip end time in seconds",
+                "description": "Explicit clip end time in seconds, greater than start_time. -1 is not a full-video sentinel.",
             },
             "query": {
                 "type": "string",
@@ -3627,6 +3599,15 @@ class VideoClipQA(BaseTool):
         },
         "required": ["start_time", "end_time", "query"],
     }
+
+    def validate_args(self, **kwargs) -> bool:
+        super().validate_args(**kwargs)
+        start, end = _parse_time_seconds(kwargs.get("start_time")), _parse_time_seconds(kwargs.get("end_time"))
+        if end == -1:
+            raise ValueError("Video_Clip_QA does not support end_time=-1. Supply an explicit end time within the video; -1 does not mean full video.")
+        if start is None or end is None or start < 0 or end <= start:
+            raise ValueError("Video_Clip_QA requires nonnegative start_time and end_time greater than start_time, in seconds.")
+        return True
 
     def run(self, start_time: Any, end_time: Any, query: str, **kwargs) -> Dict[str, Any]:
         start = _parse_time_seconds(start_time)
@@ -3698,6 +3679,7 @@ class VideoClipQA(BaseTool):
         error_text = str(qa_result.get("error", "") or "").strip()
         status = "error" if error_text else ("success" if answer else "no_valid_result")
         result = {
+            **qa_result,
             "start_time": round(float(target_range["start"]), 3),
             "end_time": round(float(target_range["end"]), 3),
             "requested_segment_id": normalized_target.get("requested_segment_id"),
@@ -3727,6 +3709,13 @@ class VideoClipQA(BaseTool):
                     result["uncertainty_value"] = parsed_json["uncertainty"]
                 if "video_summary" in parsed_json:
                     result["video_summary_value"] = parsed_json["video_summary"]
+        from toolkit.clip_events import annotate_clip_times
+
+        annotate_clip_times(
+            result,
+            offset=target_range["start"],
+            duration=target_range["end"] - target_range["start"],
+        )
         if error_text:
             result["error"] = error_text
         combined_warning = _merge_warning_messages(
@@ -3749,11 +3738,9 @@ class CrossModalVerify(BaseTool):
     
     name: str = "Cross_Modal_Verify"
     description: str = (
-        "Cross-modal consistency verification. "
-        "Input visual evidence and textual claim, determine if they contradict. "
-        "E.g., caption says 'I got the red book' but video shows blue book."
+        "Verify a textual claim against raw image/video input with the visual model. Returns verdict, full response, available reasoning, evidence and uncertainty. Text descriptions alone are insufficient; this may share the VideoQA model."
     )
-    tags: list = ["base", "crossmodal", "verification", "weak_proxy"]
+    tags: list = ["base", "crossmodal", "verification"]
     
     @property
     def model_path(self) -> str:
@@ -3766,62 +3753,41 @@ class CrossModalVerify(BaseTool):
                 "type": "string",
                 "description": "Visual evidence description"
             },
+            "image_path": {"type": "string", "description": "Actual image to inspect"},
+            "video_path": {"type": "string", "description": "Raw video to verify"},
+            "time_range": {"type": ["array", "string"], "description": "Absolute video window in seconds"},
             "textual_claim": {
                 "type": "string",
                 "description": "Textual claim to verify"
             }
         },
-        "required": ["visual_evidence", "textual_claim"]
+        "required": ["textual_claim"]
     }
     
-    def run(self, visual_evidence: str, textual_claim: str, **kwargs) -> Dict[str, Any]:
-        """Execute cross-modal verification.
-        
-        Args:
-            visual_evidence: Visual description
-            textual_claim: Text to verify
-            **kwargs: Additional arguments
-            
-        Returns:
-            Verification result
-        """
-        visual_tokens = set(_tokenize(visual_evidence))
-        claim_tokens = set(_tokenize(textual_claim))
-        shared = len(visual_tokens.intersection(claim_tokens))
-        denom = max(1, len(claim_tokens))
-        consistency_score = shared / denom
-
-        negation_pairs = [
-            ("red", "blue"),
-            ("inside", "outside"),
-            ("day", "night"),
-            ("with", "without"),
-        ]
-        contradiction = False
-        for left, right in negation_pairs:
-            if left in visual_tokens and right in claim_tokens:
-                contradiction = True
-                break
-            if right in visual_tokens and left in claim_tokens:
-                contradiction = True
-                break
-
-        is_consistent = (consistency_score >= 0.2) and (not contradiction)
-        result = {
-            "visual_evidence": visual_evidence,
-            "textual_claim": textual_claim,
-            "is_consistent": is_consistent,
-            "confidence": round(1.0 - abs(0.5 - consistency_score), 4),
-            "explanation": (
-                "Visual and textual modalities are consistent"
-                if is_consistent
-                else "Potential contradiction or weak overlap between visual evidence and claim"
-            ),
-        }
-        result = enrich_tool_result(result, tool_name=self.name)
-        
-        logger.info(f"Cross_Modal_Verify: '{textual_claim}' vs '{visual_evidence}' using {self.model_path}")
-        return result
+    def run(self, visual_evidence: str = "", textual_claim: str = "", image_path=None,
+            video_path=None, time_range=None, **kwargs) -> Dict[str, Any]:
+        from toolkit.model_results import generate_model_result
+        prompt = ("Check the claim against the supplied raw visual evidence. Return JSON with "
+                  "verdict (supported/contradicted/unknown), reasoning, evidence, and uncertainty. "
+                  "Do not treat the supplied evidence description as an observed fact. "
+                  f"Claim: {textual_claim}\nEvidence description: {visual_evidence}")
+        image = image_path or (visual_evidence if _is_readable_image(Path(str(visual_evidence))) else None)
+        if image:
+            resolved = _resolve_image_path(image)
+            if resolved is None:
+                return {"status": "error", "error": "Image input is unavailable.", "result": "Cannot verify without the requested image."}
+            provider = _get_cached_visual_generation_provider(model_path=self.model_path)
+            result = generate_model_result(provider, [{"role": "user", "content": [
+                {"type": "image", "image": resolved["path"]}, {"type": "text", "text": prompt}]}],
+                enable_thinking=settings.tool_reasoning_enabled, respect_role_generation_config=False,
+                max_tokens=settings.tool_reasoning_max_new_tokens, temperature=.6)
+            result.update(status="success", backend="visual_model", source_image=resolved["path"], model_path=self.model_path,
+                          model_forward_executed=True, independent_model=False)
+            return result
+        if video_path or time_range is not None:
+            return _run_visual_task(prompt, video_path=video_path, time_range=time_range, **kwargs)
+        return {"status": "no_valid_result", "result": "Supply image_path or video_path/time_range for actual cross-modal verification. Two text descriptions alone are not visual evidence.",
+                "verdict": "unknown", "model_forward_executed": False}
 
 
 class InspectFrame(BaseTool):
@@ -3843,6 +3809,7 @@ class InspectFrame(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "image_path": {"type": ["string", "null"], "description": "Existing evidence image to return directly without resampling"},
             "timestamp": {
                 "type": ["string", "number", "array", "null"],
                 "description": "Single timestamp or list of timestamps to inspect as single-frame snapshots",
@@ -3869,7 +3836,7 @@ class InspectFrame(BaseTool):
                 "default": None
             },
             "query": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": "What to look for in the frames",
                 "default": None
             }
@@ -3886,7 +3853,7 @@ class InspectFrame(BaseTool):
 
         has_timestamp = timestamp not in (None, "", [], {})
         has_time_window = t_start not in (None, "", [], {}) and t_end not in (None, "", [], {})
-        if not (has_timestamp or has_time_window):
+        if not (kwargs.get("image_path") or has_timestamp or has_time_window):
             raise ValueError("Inspect_Frame requires timestamp, or both t_start and t_end.")
         _coerce_numeric_scalar_or_list("density", density)
         return True
@@ -3915,6 +3882,8 @@ class InspectFrame(BaseTool):
         Returns:
             Detailed frame analysis
         """
+        if kwargs.get("image_path"):
+            return _existing_image_evidence(kwargs["image_path"], self.name)
         rows = _iter_processed_segments()
         specs = _build_visual_probe_specs(
             timestamp=timestamp,
@@ -4067,6 +4036,7 @@ class Crop(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "coordinate_space": {"type": "string", "enum": ["auto", "pixels", "normalized"], "default": "auto"},
             "image": {
                 "type": "string",
                 "description": "Image identifier or path"
@@ -4113,7 +4083,7 @@ class Crop(BaseTool):
                 tool_name=self.name,
             )
 
-        left, top, right, bottom = _normalize_xywh_region(bbox, rgb_image.width, rgb_image.height)
+        left, top, right, bottom = _normalize_xywh_region(bbox, rgb_image.width, rgb_image.height, kwargs.get("coordinate_space", "auto"))
         cropped = rgb_image.crop((left, top, right, bottom))
 
         output_evidence = _persist_transformed_image(
@@ -4144,7 +4114,8 @@ class Crop(BaseTool):
             },
         )
         
-        logger.info(f"Crop image {source_path} with bbox {bbox} using {self.model_path}")
+        result.update(backend="PIL_crop", model_forward_executed=False)
+        logger.info(f"Crop image {source_path} with bbox {bbox} using PIL")
         return enrich_tool_result(result, tool_name=self.name)
 
 
@@ -4153,9 +4124,8 @@ class ZoomIn(BaseTool):
     
     name: str = "Zoom_in"
     description: str = (
-        "Zoom in on local image region with resolution enhancement. "
-        "Used to identify tiny visual features (e.g., distinguishing distant object color, texture details), "
-        "simulating human 'looking closer' behavior."
+        "Crop and enlarge a region using PIL LANCZOS resampling for closer inspection. "
+        "Does not run neural super-resolution or recover details absent from the source image."
     )
     tags: list = ["base", "visual", "enhance"]
     
@@ -4166,6 +4136,7 @@ class ZoomIn(BaseTool):
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "coordinate_space": {"type": "string", "enum": ["auto", "pixels", "normalized"], "default": "auto"},
             "image": {
                 "type": "string",
                 "description": "Image identifier or path"
@@ -4223,6 +4194,7 @@ class ZoomIn(BaseTool):
             region_of_interest,
             rgb_image.width,
             rgb_image.height,
+            kwargs.get("coordinate_space", "auto"),
         )
         cropped = rgb_image.crop((left, top, right, bottom))
         zoomed = cropped.resize(
@@ -4269,5 +4241,6 @@ class ZoomIn(BaseTool):
             },
         )
         
-        logger.info(f"Zoom_in on image {source_path} at ROI {region_of_interest} by {zoom_factor}x using {self.model_path}")
+        result.update(backend="PIL_crop_resize", model_forward_executed=False)
+        logger.info(f"Zoom_in on image {source_path} at ROI {region_of_interest} by {zoom_factor}x using PIL")
         return enrich_tool_result(result, tool_name=self.name)

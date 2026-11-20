@@ -63,23 +63,16 @@ def resolve_ground_truth_labels(ground_truth: Any, options: Any) -> List[str]:
         if normalized == _normalize_text(label):
             values.append(label)
 
-    option_label_match = re.search(r"\b([A-Z])\b", text.upper())
+    # A label must be the complete value; the article in "onto a surface" is not option A.
+    option_label_match = re.fullmatch(r"\(?([A-Z])\)?[.)]?", text.upper())
     if option_label_match and option_label_match.group(1) in labels:
         values.append(option_label_match.group(1))
 
     if normalized in option_text_to_label:
         values.append(option_text_to_label[normalized])
 
-    try:
-        numeric_value = int(float(text))
-    except Exception:
-        numeric_value = None
-
-    if numeric_value is not None and labels:
-        if 0 <= numeric_value < len(labels):
-            values.append(labels[numeric_value])
-        if 1 <= numeric_value <= len(labels):
-            values.append(labels[numeric_value - 1])
+    # Numeric answer text is matched above. Index conventions belong to the dataset loader;
+    # accepting both zero- and one-based indices here silently creates multiple gold labels.
 
     return _dedupe(values)
 
@@ -96,7 +89,7 @@ def extract_predicted_label(final_answer: Any, options: Any) -> str:
     patterns = (
         r"(?:FINAL ANSWER|ANSWER|OPTION|CHOOSE|PICK)\s*(?:IS|:)?\s*\(?([A-Z])\)?",
         r"\(([A-Z])\)",
-        r"\b([A-Z])\b",
+        r"^\s*([A-Z])(?:[.)\]:-]|\s*$)",
     )
     for pattern in patterns:
         matches = re.findall(pattern, answer_upper)
@@ -194,6 +187,17 @@ def _collect_tool_records(trajectory: Any) -> List[Dict[str, Any]]:
         return []
 
     depth = int(trajectory.get("depth", 0) or 0)
+    execution_events = trajectory.get("tool_execution_events")
+    if isinstance(execution_events, list):
+        records = [dict(e) for e in execution_events if e.get("executed") is True]
+        seen_children = set()
+        for step in trajectory.get("steps", []) or []:
+            for child in _iter_child_trajectories(step):
+                key = child.get("task_id") or id(child)
+                if key not in seen_children:
+                    seen_children.add(key)
+                    records.extend(_collect_tool_records(child))
+        return records
     records: List[Dict[str, Any]] = []
     for step in trajectory.get("steps", []) or []:
         if not isinstance(step, dict):
@@ -212,7 +216,10 @@ def _collect_tool_records(trajectory: Any) -> List[Dict[str, Any]]:
         if action == "Parallel":
             observation_items = step.get("observation_items")
             nested_records = [
-                {**item, "depth": depth}
+                {**item, "status": str(item.get("status") or (
+                    "error" if item.get("error") or str(item.get("result", "")).lower().startswith("error")
+                    else "success"
+                )), "depth": depth}
                 for item in _iter_nested_observation_items(observation_items)
                 if str(item.get("tool", "")).strip() not in {"", "Parallel", "System", "Assistant_Note"}
             ]

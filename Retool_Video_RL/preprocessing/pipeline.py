@@ -225,7 +225,11 @@ class PipelineConfig:
     whisper_cpu_chunk_seconds: int = field(default_factory=lambda: max(0, int(settings.asr_cpu_chunk_seconds)))
     whisper_cpu_chunk_threshold_seconds: int = field(default_factory=lambda: max(0, int(settings.asr_cpu_chunk_threshold_seconds)))
     whisper_cpu_threads: int = field(default_factory=lambda: max(1, int(settings.asr_cpu_threads)))
-    asr_device: Optional[str] = field(default_factory=lambda: str(settings.preprocess_asr_device or "cpu"))
+    asr_device: Optional[str] = field(
+        default_factory=lambda: str(
+            os.environ.get("TOOLSTAR_ASR_DEVICE") or settings.preprocess_asr_device or "cpu"
+        )
+    )
     
     # Visual processing (Frame Captions)
     vision_model: str = field(default_factory=lambda: settings.qwen_vl_model_path)
@@ -454,6 +458,7 @@ class VideoPreprocessingPipeline:
                     segment_index2name,
                     segment_times_info=segment_times_info,
                     reuse_cache=self.config.reuse_cache,
+                    video_path=video_path,
                 )
         else:
             transcripts = self.asr_processor.transcribe_segments(
@@ -462,8 +467,13 @@ class VideoPreprocessingPipeline:
                 segment_index2name,
                 segment_times_info=segment_times_info,
                 reuse_cache=self.config.reuse_cache,
+                video_path=video_path,
             )
-        
+
+        # Release GPU Whisper once transcripts exist (same as VAS); a reusable worker can opt out.
+        if str(os.environ.get("TOOLSTAR_PERSIST_ASR_RUNTIME", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+            self.asr_processor.unload_model()
+
         # Step 3: Generate captions
         logger.info("Step 3: Generating captions...")
         try:

@@ -1,5 +1,6 @@
 """Recursive engine - the brain of the system."""
 import ast
+import copy
 import hashlib
 import json
 import logging
@@ -27,6 +28,8 @@ from core.llm import (
 )
 from core.memory import ContextManager, MaxRecursionError, Trajectory
 from runtime.session import runtime_session
+from core.llm.inference_metrics import inference_scope
+from toolkit.behavior_metrics import iter_result_references
 from toolkit.impl.visual import (
     prepare_planner_image_attachment,
     summarize_planner_image_evidence,
@@ -36,8 +39,10 @@ from toolkit.observation_utils import (
     build_parallel_observation,
     extract_planner_result_text,
     format_compact_observation,
+    infer_observation_status,
 )
 from toolkit.registry import registry
+from toolkit.time_utils import normalize_visual_time_args, parse_time_seconds, parse_time_range
 from .abstract_tool_resolution import (
     _normalize_field_aliases,
     build_abstract_signature,
@@ -46,6 +51,9 @@ from .abstract_tool_resolution import (
 )
 from .mediation_policy import (
     RULE_LOCKED_TARGET,
+    build_resolver_review_message,
+    describe_planner_action,
+    validate_resolved_time_scope,
     build_root_mediation_context as build_root_mediation_context_payload,
     classify_root_action,
     compact_tool_schemas_for_prompt,
@@ -259,7 +267,6 @@ class RecursiveEngine:
         self.llm = self.planner_llm
         self.context = context_manager or ContextManager()
         self.root_trajectory: Optional[Trajectory] = None
-        self._active_executed_tool_signatures: Dict[str, str] = {}
         self.raw_trace_jsonl_path = raw_trace_jsonl_path
         self.extra_params = kwargs
         wall_clock_deadline = kwargs.get("wall_clock_deadline_monotonic", kwargs.get("wall_clock_deadline"))
@@ -514,22 +521,26 @@ class RecursiveEngine:
         final_answer: str,
         success: bool,
         execution_meta: Optional[Dict[str, Any]] = None,
+        executed_results: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         meta = dict(execution_meta or {})
         payload = {
             "mode": "planner_action_mediation",
-            "status": str(meta.get("status") or ("success" if success else "error")),
+            "status": "success" if success else (str(meta.get("status")) if meta.get("status") and meta.get("status") != "success" else "error"),
             "executed_tool": str(meta.get("tool", "")).strip(),
             "executed_params": meta.get("args", {}) if isinstance(meta.get("args"), dict) else {},
-            "tool_status": str(meta.get("status") or ("success" if success else "error")),
+            "tool_status": str(meta.get("tool_status") or meta.get("status") or ("success" if success else "error")),
             "observation_text": str(meta.get("observation", "")).strip(),
             "observation_payload": meta.get("payload"),
             "source": str(meta.get("source", "subagent")).strip() or "subagent",
             "abstract_tool": str(meta.get("abstract_tool", "")).strip(),
             "final_result": final_answer,
+            # Complete outputs of every concrete call in this session; Return text never replaces them.
+            "executed_results": list(executed_results or []),
             "success": bool(success),
             "is_recursive": bool(meta.get("is_recursive", False)),
             "executed": bool(meta.get("executed", False)),
+            "resolver_decided_return": bool(meta.get("resolver_decided_return", False)),
         }
         return json.dumps(payload, ensure_ascii=False)
 
@@ -648,10 +659,12 @@ class RecursiveEngine:
             )
 
             if mediation_mode:
+                from .resolver_results import collect_executed_results
                 final_answer = self._build_mediation_return(
                     final_answer=final_answer,
                     success=success,
                     execution_meta=execution_meta,
+                    executed_results=collect_executed_results(trajectory.steps),
                 )
             
             trajectory.finish(final_answer, success=success)
@@ -742,14 +755,12 @@ class RecursiveEngine:
         # Discovered tools: populated when Tool_Search returns results.
         # Injected into context so the planner can call them in subsequent steps.
         discovered_tools_desc: str = ""
+        resolver_search_results: Dict[str, Dict[str, Any]] = {}
         root_effective_tool_executed = False
         last_observation_signature = ""
         consecutive_low_progress = 0
         low_progress_hint_sent = False
         blocked_action_signatures: set[str] = set()
-        if depth == 0 or not isinstance(getattr(self, "_active_executed_tool_signatures", None), dict):
-            self._active_executed_tool_signatures = {}
-        executed_tool_signatures = self._active_executed_tool_signatures
         repeated_loop_violations = 0
         subagent_toolsearch_failures = 0
         MAX_SUBAGENT_TOOLSEARCH_FAILURES = 3
@@ -770,6 +781,9 @@ class RecursiveEngine:
             if mediation_mode
             else ""
         )
+        planner_supplied_args = json.loads(self._extract_context_section(
+            context_info, "[Planner-Supplied Parameters]\n"
+        ) or "{}") if mediation_mode else {}
         evidence_slots: List[Dict[str, str]] = []
         visual_probe_count = 0
         retrieval_probe_count = 0
@@ -1378,8 +1392,13 @@ class RecursiveEngine:
                 if value in (None, "", [], {}):
                     return None
                 if isinstance(value, (int, float)):
-                    numeric = float(value)
+                    numeric = parse_time_seconds(value)
+                    if numeric is None:
+                        return None
                     return (numeric, numeric)
+                parsed_range = parse_time_range(value)
+                if parsed_range is not None:
+                    return (min(parsed_range), max(parsed_range))
                 if isinstance(value, (list, tuple)) and len(value) == 2:
                     try:
                         start = float(value[0])
@@ -1396,10 +1415,10 @@ class RecursiveEngine:
                     end = float(match.group(2))
                     return (min(start, end), max(start, end))
                 try:
-                    numeric = float(text)
+                    numeric = parse_time_seconds(text)
                 except Exception:
                     return None
-                return (numeric, numeric)
+                return (numeric, numeric) if numeric is not None else None
 
             if isinstance(payload, str):
                 try:
@@ -1428,8 +1447,8 @@ class RecursiveEngine:
                     t_end = payload.get("time_range_end", payload.get("end_time"))
                 if t_start not in (None, "") or t_end not in (None, ""):
                     try:
-                        start = float(t_start if t_start not in (None, "") else t_end)
-                        end = float(t_end if t_end not in (None, "") else t_start)
+                        start = parse_time_seconds(t_start if t_start not in (None, "") else t_end)
+                        end = parse_time_seconds(t_end if t_end not in (None, "") else t_start)
                     except Exception:
                         start = end = None
                     if start is not None and end is not None:
@@ -1630,6 +1649,38 @@ class RecursiveEngine:
                     result=item.get("result", ""),
                     status=str(item.get("status", "success")),
                 )
+                if mediation_mode:
+                    _store_result_aliases(str(item.get("tool", "Unknown")), item.get("result"))
+                    label = _normalize_variable_key(str(item.get("tool", "Unknown")))
+                    record["result_reference"] = "$last_" + label + "_result"
+                    raw = item.get("result")
+                    if item.get("tool") == "Execute_Plan" and isinstance(raw, dict):
+                        record["execution_tree"] = [
+                            {"id": node.get("id"), "plan_depth": node.get("plan_depth"),
+                             "search_id": node.get("search_id"),
+                             "observation": build_planner_observation_record(
+                                 tool_name=node.get("tool") or "Plan_Node", result=node.get("result"), status=node.get("status"))}
+                            for node in raw.get("execution_tree", []) if node.get("tool") or node.get("status") == "error"]
+                    if isinstance(raw, dict):
+                        record["result_fields"] = {key: type(value).__name__ for key, value in raw.items()}
+                        references = []
+                        for child in raw.get("items", []) if isinstance(raw.get("items"), list) else []:
+                            if not isinstance(child, dict) or not child.get("tool"):
+                                continue
+                            pointer = "$last_" + _normalize_variable_key(child["tool"]) + "_result"
+                            value = _resolve_pointer_expression(pointer)
+                            if value is _unresolved_pointer:
+                                continue
+                            shape = {"reference": pointer, "type": type(value).__name__}
+                            if isinstance(value, list):
+                                shape["length"] = len(value)
+                                if value and isinstance(value[0], dict):
+                                    shape["item_fields"] = list(value[0])
+                            elif isinstance(value, dict):
+                                shape["fields"] = {key: type(item).__name__ for key, item in value.items()}
+                            if shape not in references:
+                                references.append(shape)
+                        record["available_result_references"] = references
                 sanitized_image_evidence: List[Dict[str, Any]] = []
                 for image_item in record.get("image_evidence", []) or []:
                     prepared_item = prepare_planner_image_attachment(image_item)
@@ -1810,6 +1861,10 @@ class RecursiveEngine:
             if act_name == "Finish":
                 payload["Actions"] = []
                 payload["Finish"] = act_args if isinstance(act_args, dict) else {}
+            elif act_name in {"Resolver_Turn", "Execute_Plan"}:
+                payload["Actions"] = act_args.get("nodes", [])
+                if act_name == "Resolver_Turn":
+                    payload["Search"] = act_args.get("searches", [])
             else:
                 payload["Actions"] = _build_actions_payload(act_name, act_args)
             if evidence_first_mode and evidence_slots:
@@ -2102,6 +2157,7 @@ class RecursiveEngine:
                     "video": args.get("video") or args.get("video_path") or args.get("segment_id"),
                     "start_time": start,
                     "end_time": end,
+                    "query": args.get("query"),
                 }
             elif isinstance(args, dict) and normalized_name in {"Inspect_Frame", "OCR_Extract"}:
                 raw_timestamp = args.get("timestamp")
@@ -2109,12 +2165,12 @@ class RecursiveEngine:
                     normalized_timestamp: Any = []
                     for item in raw_timestamp:
                         try:
-                            normalized_timestamp.append(round(float(item), 3))
+                            normalized_timestamp.append(round(parse_time_seconds(item), 3))
                         except Exception:
                             normalized_timestamp.append(str(item).strip())
                 elif raw_timestamp not in (None, ""):
                     try:
-                        normalized_timestamp = round(float(raw_timestamp), 3)
+                        normalized_timestamp = round(parse_time_seconds(raw_timestamp), 3)
                     except Exception:
                         normalized_timestamp = str(raw_timestamp).strip()
                 else:
@@ -2126,6 +2182,7 @@ class RecursiveEngine:
                     "language": args.get("language") if normalized_name == "OCR_Extract" else None,
                     "image_region": args.get("image_region") if normalized_name == "OCR_Extract" else None,
                     "video": args.get("video") or args.get("video_path") or args.get("segment_id"),
+                    "image_path": args.get("image_path"),
                 }
             try:
                 return f"{name}:{json.dumps(normalized_args, ensure_ascii=False, sort_keys=True)}"
@@ -2316,6 +2373,8 @@ class RecursiveEngine:
             executed: bool = True,
         ) -> None:
             nonlocal last_execution_meta
+            if executed and source == "tool":
+                runtime_session.note_tool_result(tool_name, raw_result, args=tool_args, status=observation_status)
             _, _, compact_payload = format_compact_observation(
                 raw_result if raw_result not in (None, "") else {"result": observation_text, "status": observation_status},
                 tool_name=tool_name,
@@ -2324,6 +2383,7 @@ class RecursiveEngine:
                 "tool": str(tool_name or "").strip(),
                 "args": dict(tool_args or {}),
                 "status": str(observation_status or "success").strip() or "success",
+                "tool_status": str(observation_status or "success").strip() or "success",
                 "payload": compact_payload,
                 "observation": observation_text,
                 "source": str(source or "tool").strip() or "tool",
@@ -2398,11 +2458,24 @@ class RecursiveEngine:
                             or raw_sub_result
                         ).strip(),
                         "status": str(
-                            envelope.get("tool_status")
-                            or envelope.get("status")
+                            envelope.get("status")
+                            or envelope.get("tool_status")
                             or "success"
                         ),
                     }
+                executed_results = envelope.get("executed_results")
+                if isinstance(executed_results, list) and executed_results:
+                    from .resolver_results import build_planner_payload
+                    # The resolver's Return is only its note; the parent receives the complete tool outputs.
+                    returned = envelope.get("observation_payload")
+                    raw_payload = build_planner_payload(
+                        [r for r in executed_results if isinstance(r, dict)],
+                        returned if returned not in (None, "") else envelope.get("final_result"),
+                        task_status=str(envelope.get("status") or "error"),
+                    )
+                    names = {str(r.get("tool", "")).strip() for r in executed_results if isinstance(r, dict)}
+                    if len(names) == 1 and next(iter(names)):
+                        executed_tool = next(iter(names))
                 if isinstance(raw_payload, dict):
                     payload = dict(raw_payload)
                     payload.setdefault("source", "subagent")
@@ -2416,12 +2489,12 @@ class RecursiveEngine:
                     tool_name=executed_tool,
                 )
                 final_status = str(
-                    envelope.get("tool_status")
-                    or envelope.get("status")
+                    envelope.get("status")
+                    or envelope.get("tool_status")
                     or inferred_status
                     or "success"
                 ).strip() or "success"
-                if not executed:
+                if not executed and not envelope.get("resolver_decided_return"):
                     payload = {
                         "status": "error",
                         "result": (
@@ -2438,6 +2511,9 @@ class RecursiveEngine:
                     )
                     final_status = "error"
                 planner_payload = payload if payload not in (None, "", {}) else compact_payload
+                if isinstance(planner_payload, dict):
+                    planner_payload["result_reference"] = "$last_resolver_result"
+                self.context.set_variable("last_resolver_result", planner_payload)
                 planner_result_text = extract_planner_result_text(
                     planner_payload,
                     tool_name=executed_tool,
@@ -2519,29 +2595,12 @@ class RecursiveEngine:
                         "tool_name": resolution.get("tool_name"),
                         "params": resolution.get("params", {}),
                     }
-            else:
-                resolution = _resolve_virtual_subagent_action(
-                    abstract_tool=action_name,
-                    abstract_args=action_args,
-                    description_text=description_text,
-                )
-                candidate_tools = list(
-                    (resolution.get("observation", {}) or {}).get("candidate_tools", [])
-                    if isinstance(resolution.get("observation", {}), dict)
-                    else []
-                )
-                if resolution.get("resolved"):
-                    execution_hint = {
-                        "tool_name": resolution.get("tool_name"),
-                        "params": resolution.get("params", {}),
-                    }
-
             return build_root_mediation_context_payload(
                 action_name=action_name,
                 action_args=action_args,
                 description_text=description_text,
                 policy=policy,
-                discovered_tools_desc=_compact_discovered_tools_for_subagent(),
+                discovered_tools_desc="",
                 target_schema=target_schema,
                 candidate_tools=candidate_tools,
                 execution_hint=execution_hint,
@@ -2640,7 +2699,13 @@ class RecursiveEngine:
             policy = _classify_root_action(action_name, action_args)
             resolution: Dict[str, Any] = {}
 
-            if policy.get("tool_exists") and not tool.is_virtual:
+            if tool.is_virtual:
+                return {"handled": False, "tool": action_name,
+                        "delegate_action_name": action_name, "delegate_action_args": action_args}
+
+            if policy.get("direct_executable"):
+                resolution = {"resolved": True, "tool_name": tool.name, "params": action_args}
+            elif policy.get("tool_exists") and not tool.is_virtual:
                 target_schema = tool.get_schema()
                 resolution = resolve_abstract_tool_call(
                     abstract_tool=action_name,
@@ -2710,7 +2775,7 @@ class RecursiveEngine:
                             },
                             "observation": error_text,
                             "delegate_action_name": routed_name,
-                            "delegate_action_args": routed_args,
+                            "delegate_action_args": {**action_args, **routed_args},
                         }
                     if obs_status == "error" and _looks_like_parameter_error(result, observation_text):
                         error_text = _extract_error_text_from_payload(result) or str(observation_text or "").strip() or "invalid parameters"
@@ -2733,7 +2798,7 @@ class RecursiveEngine:
                             },
                             "observation": error_text,
                             "delegate_action_name": routed_name,
-                            "delegate_action_args": routed_args,
+                            "delegate_action_args": {**action_args, **routed_args},
                         }
                     if obs_status == "success":
                         success = True
@@ -2752,7 +2817,7 @@ class RecursiveEngine:
                         "payload": result,
                         "observation": observation_text,
                         "delegate_action_name": routed_name,
-                        "delegate_action_args": routed_args,
+                        "delegate_action_args": {**action_args, **routed_args},
                     }
                 if routed_policy.get("tool_exists"):
                     return {
@@ -2762,7 +2827,7 @@ class RecursiveEngine:
                         "payload": resolution.get("observation"),
                         "observation": str((resolution.get("observation", {}) or {}).get("result", "")),
                         "delegate_action_name": routed_name,
-                        "delegate_action_args": routed_args,
+                        "delegate_action_args": {**action_args, **routed_args},
                     }
 
             return {
@@ -2792,29 +2857,6 @@ class RecursiveEngine:
         def _clear_identical_action_failure(signature: str) -> None:
             if signature in identical_action_failures:
                 del identical_action_failures[signature]
-
-        def _concrete_tool_execution_signature(tool_name: str, resolved_args: Dict[str, Any]) -> str:
-            return _action_signature(
-                str(tool_name or "").strip(),
-                resolved_args if isinstance(resolved_args, dict) else {},
-            )
-
-        def _duplicate_tool_execution_message(tool_name: str, resolved_args: Dict[str, Any]) -> str:
-            normalized_tool = str(tool_name or "").strip()
-            call_preview = _format_action_for_history(normalized_tool, resolved_args)
-            execution_signature = _concrete_tool_execution_signature(normalized_tool, resolved_args)
-            previous_preview = executed_tool_signatures.get(execution_signature, call_preview)
-            blocked_message = (
-                "Error: this exact tool call was already executed earlier in this run: "
-                f"{previous_preview}. You cannot execute the same tool with the same parameters twice. "
-                "Choose a different tool or materially different arguments."
-            )
-            if evidence_first_mode:
-                blocked_message += (
-                    " Continue from nearby evidence windows or switch to another relevant retrieval, "
-                    "visual, or verification tool."
-                )
-            return blocked_message.strip()
 
         def _append_memory_state_message(key: str, message: str, *, limit: int = 8) -> None:
             normalized_message = str(message or "").strip()
@@ -2960,7 +3002,13 @@ class RecursiveEngine:
                 resolved = _resolve_pointer_expression(value)
                 return value if resolved is _unresolved_pointer else resolved
             if isinstance(value, list):
-                return [_resolve_tool_args(item) for item in value]
+                resolved_items = [_resolve_tool_args(item) for item in value]
+                # A parameter written as several result pointers that each resolve to a list ("gather the records
+                # of these windows") is one concatenated list, not a list of lists.
+                if value and all(isinstance(item, str) and item.strip().startswith("$") for item in value) \
+                        and all(isinstance(item, list) for item in resolved_items):
+                    return [row for group in resolved_items for row in group]
+                return resolved_items
             if isinstance(value, dict):
                 return {key: _resolve_tool_args(item) for key, item in value.items()}
             return value
@@ -3023,8 +3071,39 @@ class RecursiveEngine:
                 ):
                     self.context.set_variable(candidate, payload)
 
+        def _prepare_child_intent(description, args):
+            supplied_intent = description if isinstance(description, str) else ""
+            if not supplied_intent.strip() and isinstance(args, dict):
+                supplied_intent = next((args[key] for key in ("intent_description", "goal", "query")
+                    if isinstance(args.get(key), str) and args[key].strip()), "")
+            if not supplied_intent.strip():
+                raise ValueError("A delegated intent needs a description stating its goal, inputs and required product. Unknown tool names alone are not a delegation.")
+            missing = [ref for ref in iter_result_references(args) if _resolve_pointer_expression(ref) is _unresolved_pointer]
+            if missing:
+                raise ValueError("Unresolved child input reference(s): " + ", ".join(missing))
+            return _resolve_tool_args(args)
+
         def _prepare_concrete_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             resolved_args = _resolve_tool_args(args if isinstance(args, dict) else {})
+            event = {
+                "event_id": f"{agent.trajectory.task_id}:tool:{len(agent.trajectory.tool_execution_events) + 1}",
+                "tool": name, "args": dict(resolved_args), "depth": depth,
+                "iteration": iteration, "executed": False, "status": "pending",
+                "planner_action": self._extract_context_section(context_info, "[Planner Action Name]\n") if mediation_mode else name,
+                "planner_args": dict(planner_supplied_args) if mediation_mode else dict(resolved_args),
+                "intent_fulfillment": "not_evaluated",
+                "requested_args": copy.deepcopy(args),
+                "result_references": {ref: _resolve_pointer_expression(ref) is not _unresolved_pointer
+                                      for ref in iter_result_references(args)},
+                "dispatch_mode": "serial",
+            }
+            agent.trajectory.tool_execution_events.append(event)
+            unresolved = [ref for ref, found in event["result_references"].items() if not found]
+            if unresolved:
+                message = ("Unresolved result reference(s): " + ", ".join(unresolved)
+                    + ". Use an existing result/node and field; an empty list is valid, a missing field is not.")
+                event.update(status="error", reason="unresolved_result_reference", error=message)
+                raise ValueError(message)
             logger.info(
                 "%s[%s][Depth %d] Executing tool: %s",
                 '  ' * depth,
@@ -3034,6 +3113,7 @@ class RecursiveEngine:
             )
             blocked_message = _blocked_no_valid_result_message(name)
             if blocked_message:
+                event.update(status="error", reason="no_valid_result_retry_blocked")
                 result = {
                     "status": "error",
                     "result": blocked_message,
@@ -3048,41 +3128,25 @@ class RecursiveEngine:
                     "result": result,
                     "source": "system",
                     "executed": False,
-                }
-            execution_signature = _concrete_tool_execution_signature(str(name or "").strip(), resolved_args)
-            duplicate_message = ""
-            if execution_signature in executed_tool_signatures:
-                duplicate_message = _duplicate_tool_execution_message(str(name or "").strip(), resolved_args)
-            if duplicate_message:
-                result = {
-                    "status": "error",
-                    "result": duplicate_message,
-                    "blocked_tool": str(name or "").strip(),
-                    "reason": "duplicate_tool_execution_rejected",
-                    "source": "system",
-                }
-                _append_memory_state_message(
-                    "do_not_repeat",
-                    f"{_format_action_for_history(str(name or '').strip(), resolved_args)}: already executed once in this run; do not call it again.",
-                )
-                return {
-                    "tool_name": str(name or "").strip(),
-                    "resolved_args": resolved_args,
-                    "mode": "duplicate_rejected",
-                    "result": result,
-                    "source": "system",
-                    "executed": False,
-                    "execution_signature": execution_signature,
+                    "execution_event": event,
                 }
             tool = registry.get_tool(name, log_missing=False)
             if tool.is_virtual:
+                event.update(status="error", reason="tool_not_executable")
                 raise ValueError(f"Tool '{name}' is not executable.")
+            if mediation_mode:
+                try:
+                    scope_args = _resolve_tool_args(planner_supplied_args)
+                    validate_resolved_time_scope(scope_args, name, resolved_args)
+                    resolved_image = resolved_args.get("image_path") or resolved_args.get("image")
+                    original_image = scope_args.get("image_path") or scope_args.get("image")
+                    if original_image and (not resolved_image or Path(str(resolved_image)).expanduser().resolve() != Path(str(original_image)).expanduser().resolve()):
+                        raise ValueError("Resolved image_path must preserve the planner-supplied image; do not resample another frame.")
+                except ValueError as exc:
+                    event.update(status="error", reason="intent_scope_mismatch", intent_scope_status="violated", error=str(exc))
+                    raise
+                event["intent_scope_status"] = "no_detected_explicit_scope_violation"
             from toolkit.impl.retrieval import get_sparse_scope_hidden_tool_payload
-
-            executed_tool_signatures[execution_signature] = _format_action_for_history(
-                str(name or "").strip(),
-                resolved_args,
-            )
 
             video_hint = None
             if isinstance(resolved_args, dict):
@@ -3093,15 +3157,26 @@ class RecursiveEngine:
                         break
             hidden_payload = get_sparse_scope_hidden_tool_payload(name, video_hint=video_hint)
             if hidden_payload is not None:
+                event.update(status=infer_observation_status(hidden_payload), source="synthetic_result")
                 return {
                     "tool_name": str(name or "").strip(),
                     "resolved_args": resolved_args,
                     "mode": "synthetic_result",
                     "result": hidden_payload,
-                    "source": "tool",
-                    "executed": True,
-                    "execution_signature": execution_signature,
+                    "source": "system",
+                    "executed": False,
+                    "execution_event": event,
                 }
+            try:
+                tool.validate_args(**resolved_args)
+                if name in {"Sort_Time_Ranges", "Merge_Temporal_Segments", "Merge_Touching_Ranges"}:
+                    from toolkit.time_utils import normalize_temporal_records
+                    field = "segments" if name == "Merge_Temporal_Segments" else "ranges"
+                    resolved_args[field] = normalize_temporal_records(resolved_args[field], require_basis=_active_local_video_scope_present())
+                    event["args"] = dict(resolved_args)
+            except ValueError as exc:
+                event.update(status="error", reason="invalid_arguments", error=str(exc))
+                raise
             return {
                 "tool_name": str(name or "").strip(),
                 "resolved_args": resolved_args,
@@ -3109,7 +3184,7 @@ class RecursiveEngine:
                 "tool": tool,
                 "source": "tool",
                 "executed": True,
-                "execution_signature": execution_signature,
+                "execution_event": event,
             }
 
         def _run_prepared_concrete_tool_call(prepared_call: Dict[str, Any]) -> Any:
@@ -3118,7 +3193,23 @@ class RecursiveEngine:
                 tool = prepared_call.get("tool")
                 if tool is None:
                     raise ValueError("Prepared tool execution is missing tool instance.")
-                return tool.run(**prepared_call.get("resolved_args", {}))
+                event = prepared_call["execution_event"]
+                event.update(executed=True, source="tool")
+                started = time.perf_counter()
+                event["started_at"] = started
+                try:
+                    with inference_scope(actor="tool", tool=prepared_call.get("tool_name"),
+                            task_id=agent.trajectory.task_id, depth=depth, iteration=iteration,
+                            tool_event_id=event["event_id"]):
+                        result = tool.run(**prepared_call.get("resolved_args", {}))
+                    event["status"] = infer_observation_status(result)
+                    return result
+                except Exception as exc:
+                    event.update(status="error", error=str(exc))
+                    raise
+                finally:
+                    event["ended_at"] = time.perf_counter()
+                    event["duration_seconds"] = event["ended_at"] - started
             return prepared_call.get("result")
 
         def _finalize_prepared_concrete_tool_call(
@@ -3139,6 +3230,8 @@ class RecursiveEngine:
 
             _store_result_aliases(name, result)
             observation_text, observation_status, _ = format_compact_observation(result, tool_name=name)
+            if prepared_call.get("execution_event") is not None:
+                prepared_call["execution_event"]["status"] = observation_status
             if observation_status == "no_valid_result":
                 _record_no_valid_result_invalidation(name, observation_text)
             _remember_execution(
@@ -3183,10 +3276,25 @@ class RecursiveEngine:
             executable_requests: List[Dict[str, Any]] = []
 
             for request in requests:
-                prepared_call = _prepare_concrete_tool_call(
-                    str(request.get("tool_name", "")).strip(),
-                    request.get("tool_args", {}) if isinstance(request.get("tool_args", {}), dict) else {},
-                )
+                event_start = len(agent.trajectory.tool_execution_events)
+                try:
+                    prepared_call = _prepare_concrete_tool_call(
+                        str(request.get("tool_name", "")).strip(),
+                        request.get("tool_args", {}) if isinstance(request.get("tool_args", {}), dict) else {},
+                    )
+                except Exception as exc:
+                    # A malformed member must not discard valid siblings that
+                    # were prepared earlier in this same parallel batch.
+                    result = {"status": "error", "result": f"Error preparing tool call: {exc}", "error": str(exc)}
+                    event = next(iter(agent.trajectory.tool_execution_events[event_start:]), None)
+                    if event is not None:
+                        event.update(status="error", error=str(exc))
+                    prepared_call = {
+                        "tool_name": str(request.get("tool_name", "")).strip(),
+                        "resolved_args": request.get("tool_args", {}),
+                        "mode": "preparation_error", "executed": False,
+                        "source": "system", "result": result, "execution_event": event,
+                    }
                 prepared_request = dict(request)
                 prepared_request["prepared_call"] = prepared_call
                 prepared_requests.append(prepared_request)
@@ -3197,6 +3305,11 @@ class RecursiveEngine:
 
             if executable_requests:
                 worker_count = max(1, len(executable_requests))
+                if worker_count > 1:
+                    dispatch_group = f"{agent.trajectory.task_id}:parallel:{iteration}:{uuid.uuid4().hex[:8]}"
+                    for request in executable_requests:
+                        request["prepared_call"]["execution_event"].update(
+                            dispatch_mode="parallel", dispatch_group=dispatch_group)
                 logger.info(
                     "%s[%s][Depth %d] Executing %d tools concurrently within one Parallel step.",
                     '  ' * depth,
@@ -3355,7 +3468,12 @@ class RecursiveEngine:
             return value
 
         def _normalize_visual_probe_param_aliases(args: Dict[str, Any]) -> Dict[str, Any]:
-            normalized = dict(args or {})
+            normalized = normalize_visual_time_args(args or {})
+            evidence_id = normalized.get("evidence_id")
+            if isinstance(evidence_id, str) and evidence_id in runtime_session.get_tool_results():
+                if normalized.get("image_path") in (None, ""):
+                    normalized["image_path"] = evidence_id
+                normalized.pop("evidence_id", None)
 
             for source_key, target_key in (
                 ("time_range_start", "t_start"),
@@ -3413,11 +3531,13 @@ class RecursiveEngine:
             if not isinstance(args, dict):
                 return {}
             if name == "Parallel":
+                if not isinstance(args.get("batch"), list) or not args["batch"]:
+                    raise ValueError("Parallel requires a non-empty batch of named actions; use a flat Actions list for independent tools.")
                 batch = []
                 for call in args.get("batch", []):
-                    if not isinstance(call, dict):
-                        continue
-                    batch_name = str(call.get("name", "")).strip()
+                    if not isinstance(call, dict) or not str(call.get("name", "")).strip():
+                        raise ValueError("Each Parallel batch member needs a tool name and args; a query alone is not an action.")
+                    batch_name = registry.resolve_name(str(call.get("name", "")).strip())
                     batch_args = call.get("args", {})
                     batch.append({
                         "name": batch_name,
@@ -3451,6 +3571,27 @@ class RecursiveEngine:
 
             if name in {"Inspect_Frame", "OCR_Extract"}:
                 normalized = _normalize_visual_probe_param_aliases(normalized)
+            elif name == "Python_Executor":
+                for alias in ("code", "script"):
+                    if alias in normalized:
+                        if normalized.get("code_script") not in (None, "") and normalized["code_script"] != normalized[alias]:
+                            raise ValueError(f"Conflicting Python code_script and {alias}.")
+                        normalized["code_script"] = normalized.pop(alias)
+            elif name in {"Crop", "Zoom_in"}:
+                if "image_path" in normalized:
+                    if normalized.get("image") and normalized["image"] != normalized["image_path"]:
+                        raise ValueError("Conflicting image and image_path.")
+                    normalized["image"] = normalized.pop("image_path")
+            elif name == "Video_Clip_QA":
+                normalized = normalize_visual_time_args(normalized)
+                for source, target in (("t_start", "start_time"), ("t_end", "end_time")):
+                    if source in normalized:
+                        normalized[target] = normalized.pop(source)
+                start, end = normalized.get("start_time"), normalized.get("end_time")
+                if end == -1:
+                    raise ValueError("Video_Clip_QA does not support end_time=-1. Supply an explicit end time within the video; -1 does not mean full video.")
+                if start is not None and end is not None and (start < 0 or end <= start):
+                    raise ValueError("Video_Clip_QA needs a positive-duration window in seconds; use Inspect_Frame for a single timestamp.")
 
             tool = registry.get_tool(name, log_missing=False)
             if tool.is_virtual:
@@ -3490,6 +3631,7 @@ class RecursiveEngine:
                 for key, value in (args.items() if isinstance(args, dict) else [])
                 if not str(key).startswith("__")
             }
+            executable_args = _resolve_tool_args(executable_args)
 
             video_hint = None
             if isinstance(args, dict):
@@ -3519,20 +3661,21 @@ class RecursiveEngine:
             ):
                 return {
                     "rule": "rule_3_or_4_route_first",
-                    "tool_exists": False,
+                    "tool_exists": True,
                     "direct_executable": False,
-                    "target_tool_name": "",
+                    "target_tool_name": "Python_Executor",
                     "allowed_resolution_modes": [
                         "single_replacement",
                         "parallel_decomposition",
                     ],
                     "locked_target": False,
                     "python_executor_requires_evidence_first": True,
+                    "semantic_incompatibility_reason": "No executable Python code was supplied; image interpretation requires a visual tool, not Python execution.",
                 }
             return classify_root_action(
                 tool_name=name,
                 tool=tool,
-                args=args if isinstance(args, dict) else {},
+                args=executable_args,
             )
 
         def _probe_budget_exhausted() -> bool:
@@ -3681,10 +3824,9 @@ class RecursiveEngine:
                     phase,
                     type(current_llm).__name__,
                 )
-                response = current_llm.generate(
-                    messages_payload,
-                    **inline_generation_payload,
-                )
+                with inference_scope(actor="planner" if depth == 0 else "resolver",
+                        task_id=agent.trajectory.task_id, depth=depth, iteration=iteration_idx, phase=phase):
+                    response = current_llm.generate(messages_payload, **inline_generation_payload)
                 return str(response or ""), time.perf_counter() - started
 
             delegate_llm = getattr(current_llm, "delegate_llm", None)
@@ -3713,10 +3855,9 @@ class RecursiveEngine:
 
             def _generation_worker() -> None:
                 try:
-                    generation_state["response"] = current_llm.generate(
-                        messages_payload,
-                        **generation_payload,
-                    )
+                    with inference_scope(actor="planner" if depth == 0 else "resolver",
+                            task_id=agent.trajectory.task_id, depth=depth, iteration=iteration_idx, phase=phase):
+                        generation_state["response"] = current_llm.generate(messages_payload, **generation_payload)
                 except Exception as exc:
                     generation_state["error"] = exc
                 finally:
@@ -4064,6 +4205,15 @@ class RecursiveEngine:
             abstract_args: Dict[str, Any],
             description_text: str,
         ) -> Dict[str, Any]:
+            if depth > 0:
+                # Retrieval is requested by the resolver, never inferred from an unknown name.
+                candidates = [candidate for group in resolver_search_results.values()
+                              for candidate in group["candidates"]]
+                if not candidates:
+                    return {"resolved": False, "observation": {"status": "needs_decomposition", "candidate_tools": [],
+                        "result": "Use top-level Search here, or delegate a described bounded child intent with resolved inputs so that child can discover its tools together."}}
+                return resolve_abstract_tool_call(abstract_tool=abstract_tool, abstract_args=abstract_args,
+                    description=description_text, candidates=extract_candidate_tools(candidates))
             signature = build_abstract_signature(
                 tool_name=abstract_tool,
                 args=abstract_args,
@@ -4074,12 +4224,16 @@ class RecursiveEngine:
                 return cached
 
             intent_chunks = [
-                f"goal: {goal}",
+                "Retrieve by the current capability request; the broader goal is context, not a tool-class restriction.",
                 f"abstract_tool: {abstract_tool}",
                 f"abstract_args: {json.dumps(abstract_args or {}, ensure_ascii=False)}",
             ]
             if description_text:
                 intent_chunks.append(f"description: {description_text}")
+            previous = last_execution_meta.get("payload")
+            if previous is not None:
+                shape = {key: type(value).__name__ for key, value in previous.items()} if isinstance(previous, dict) else type(previous).__name__
+                intent_chunks.append("available_result_structure: " + json.dumps(shape, ensure_ascii=False))
             intent = " | ".join(intent_chunks)
             tool_search = registry.get_tool("Tool_Search")
             if tool_search.is_virtual:
@@ -4218,14 +4372,30 @@ class RecursiveEngine:
             _refresh_modality_progress()
         
         if depth == 0 and first_round_context:
+            initial_tool_results = []
             if isinstance(first_round_context, list):
-                grounding_label = list(first_round_context)
+                grounding_label = []
+                for item in first_round_context:
+                    if isinstance(item, dict) and isinstance(item.get("initial_tool_result"), dict):
+                        initial_tool_results.append(item["initial_tool_result"])
+                    else:
+                        grounding_label.append(item)
             else:
                 grounding_label = (
                     "[Initial Planner Grounding Evidence - inject once and keep in history]\n"
                     f"{first_round_context}"
                 )
             _append_history("user", grounding_label)
+            for tool_result in initial_tool_results:
+                runtime_session.note_tool_result(tool_result["tool"], tool_result["result"],
+                    args=tool_result.get("params"), status=tool_result.get("status", "success"),
+                    evidence_id="initial:whole_video_qa")
+                # This call already ran during grounding; replay its result using
+                # the same JSON action/observation protocol as later tool calls.
+                _append_history("assistant", json.dumps({
+                    "Actions": [{"tool": tool_result["tool"], "params": tool_result["params"]}],
+                }, ensure_ascii=False))
+                _append_observation_json([tool_result])
             initial_msg = f"Goal: {goal}\n\nUse the initial grounding evidence above for first-step reasoning. Begin reasoning:"
         elif context_info:
             initial_msg = f"Goal: {goal}\n\nContext:\n{context_info}\n\nBegin reasoning:"
@@ -4265,16 +4435,23 @@ class RecursiveEngine:
         planner_tool_invocation_stats: Dict[str, Dict[str, int]] = {}
         MAX_PARSE_FAILURES = 3  # Abort after N consecutive parse failures
         MAX_REPEATED_ACTIONS = 3
+        resolver_search_rounds = 0
+        consecutive_iteration_errors = 0
 
-        while iteration < agent.max_iterations and not finished:
+        # Resolver iterations remain actual model calls for timing/token accounting.
+        # Only Search-bearing turns consume its node budget; finishing pending Actions
+        # and Return remains possible after the final Search. Existing timeout,
+        # parse/repetition guards still apply to these sub-turns.
+        while not finished and (mediation_mode or iteration < agent.max_iterations):
             iteration += 1
             logger.info(
-                "%s[%s][Depth %d] Iteration %d/%d",
+                "%s[%s][Depth %d] Model turn %d (budget=%d %s)",
                 '  ' * depth,
                 role_label,
                 depth,
                 iteration,
                 agent.max_iterations,
+                "Search turns" if mediation_mode else "model turns",
             )
             self._emit_progress(
                 role=role_label.lower(),
@@ -4334,7 +4511,30 @@ class RecursiveEngine:
                         "Do not call any more tools on this turn."
                     )
                 else:
-                    current_message = "Continue reasoning:"
+                    current_message = (
+                        build_resolver_review_message(
+                            self._extract_context_section(context_info, "[Planner Action Description]\n")
+                        )
+                        if mediation_mode and settings.resolver_review_checklist else "Continue reasoning:"
+                    )
+                if mediation_mode:
+                    remaining = max(0, agent.max_iterations - resolver_search_rounds)
+                    current_message += (
+                        f"\n\n[Resolver Search Budget]\n"
+                        f"This node has used {resolver_search_rounds}/{agent.max_iterations} Search turns; "
+                        f"{remaining} remain. One model response containing top-level Search counts once, "
+                        "regardless of how many independent requests/candidates/tools it includes. "
+                        "Actions, result review and Return are sub-turns and do not consume Search turns. "
+                        "Batch independent discoveries in one Search turn. For a bounded composite task, "
+                        "you may delegate one described intent with resolved available inputs to the next depth, "
+                        "where its needed tools can be searched together under that node's own budget. "
+                        "Do not add delegation just to bypass this node's limit."
+                    )
+                    if not remaining:
+                        current_message += (
+                            " No more Search is allowed here. Complete remaining Actions using available "
+                            "schemas/results, then Return; report any unresolved evidence gap."
+                        )
                 repeated_tool_advisory = _build_root_tool_retry_advisory()
                 if repeated_tool_advisory:
                     current_message = f"{current_message}\n\n{repeated_tool_advisory}"
@@ -4364,6 +4564,9 @@ class RecursiveEngine:
                     history=full_history
                 )
                  
+                agent.trajectory.add_debug_event({"type": "llm_call", "depth": depth, "iteration": iteration,
+                    **({"resolver_search_rounds_used": resolver_search_rounds,
+                        "resolver_search_round_limit": agent.max_iterations} if mediation_mode else {})})
                 effective_generation_kwargs = _generation_kwargs_with_deadlines(generation_kwargs)
                 if iteration == 1:
                     _log_first_input_payload(messages, effective_generation_kwargs)
@@ -4375,6 +4578,7 @@ class RecursiveEngine:
                         phase="main",
                     )
                     iteration_generated_response = True
+                    consecutive_iteration_errors = 0
                 except GenerationTimeoutError as exc:
                     final_answer, success, finished = _abort_due_to_generation_timeout(
                         iteration_idx=iteration,
@@ -4751,6 +4955,38 @@ class RecursiveEngine:
                         _append_history("user", retry_msg)
                     continue
 
+                # Return may be expressed as an action by Actions-only adapters.
+                # It is control flow, never a retrievable/recursive capability.
+                if action_name == "Parallel" and isinstance(action_args, dict):
+                    batch = action_args.get("batch", [])
+                    if len(batch) == 1 and str(batch[0].get("name", "")).lower() in {"return", "resolver_return"}:
+                        action_name = "Resolver_Return"
+                        action_args = batch[0].get("args", {})
+                elif str(action_name or "").lower() in {"return", "resolver_return"}:
+                    action_name = "Resolver_Return"
+                if action_name == "Resolver_Return":
+                    if not mediation_mode:
+                        _append_history("user", "Return is for the resolver. The root planner uses Finish.")
+                        continue
+                    return_value = action_args.get("result", "$last_result")
+                    missing = [ref for ref in iter_result_references(return_value) if _resolve_pointer_expression(ref) is _unresolved_pointer]
+                    if missing:
+                        message = "Unresolved Return reference(s): " + ", ".join(missing)
+                        agent.trajectory.add_step(thought=thought, plan=plan, action="Protocol_Error", action_args=action_args, observation=message, observation_items=[{"tool": "System", "status": "error", "result": message}], is_recursive=False)
+                        _append_history("user", message)
+                        continue
+                    returned = _resolve_tool_args(return_value)
+                    observation, return_status, _ = format_compact_observation(returned, tool_name="Resolver_Return")
+                    last_execution_meta = {**last_execution_meta, "payload": returned,
+                        "observation": observation, "status": str(action_args.get("status") or return_status),
+                        "resolver_decided_return": True}
+                    agent.trajectory.add_step(thought=thought, plan=plan, action=action_name,
+                        action_args=action_args, observation=observation, is_recursive=False)
+                    final_answer = extract_planner_result_text(returned, tool_name="Resolver_Return").strip() or observation
+                    success = last_execution_meta["status"] == "success"
+                    finished = True
+                    break
+
                 # Guard invalid placeholder action names BEFORE repetition logic.
                 if action_name.lower() in _PLACEHOLDER_ACTION_NAMES:
                     logger.warning(f"Invalid action name '{action_name}', treating as parse failure")
@@ -4779,6 +5015,7 @@ class RecursiveEngine:
                 consecutive_parse_failures = 0
 
                 try:
+                    action_name = registry.resolve_name(action_name)
                     action_args = _normalize_action_args(action_name, action_args)
                 except ValueError as exc:
                     normalization_msg = (
@@ -5024,12 +5261,139 @@ class RecursiveEngine:
                     ])
                     continue
 
+                if action_name in {"Execute_Plan", "Resolver_Turn"}:
+                    from .action_tree import execute_action_tree
+                    tree_sub_trajectories = []
+                    def execute_tree_leaf(name, args, plan_depth, node_id):
+                        start_event = len(agent.trajectory.tool_execution_events)
+                        name = registry.resolve_name(name)
+                        args = dict(args)
+                        description = args.pop("__description__", "")
+                        if str(name).lower() in {"search", "tool_search", "return", "resolver_return", "finish"}:
+                            return {"error": f"{name} is a top-level control field, not an abstract child intent."}, "error", False
+                        search_id = args.pop("__search_id__", None)
+                        if search_id is not None:
+                            group = resolver_search_results.get(search_id)
+                            if group is None or registry.resolve_name(name) not in {
+                                    registry.resolve_name(c.get("name", "")) for c in group["candidates"]}:
+                                return {"error": f"Tool {name} is not a candidate of search_id={search_id}"}, "error", False
+                        tool = registry.get_tool(name, log_missing=False)
+                        if tool.is_virtual:
+                            resolution = _resolve_virtual_subagent_action(
+                                abstract_tool=name, abstract_args=args,
+                                description_text=describe_planner_action(name, args, description, thought or plan))
+                            if resolution.get("resolved"):
+                                name, args = resolution["tool_name"], resolution.get("params", {})
+                            elif _is_nonrecoverable_resolution_failure(resolution):
+                                return resolution.get("observation", {}), "error", False
+                            else:
+                                try:
+                                    args = _prepare_child_intent(description, args)
+                                except ValueError as exc:
+                                    return {"error": str(exc)}, "error", False
+                                mediated = _delegate_root_action_via_subagent(
+                                    action_name=name, action_args=args,
+                                    description_text=describe_planner_action(name, args, description, thought or plan))
+                                child = mediated.get("sub_trajectory")
+                                if child is not None:
+                                    tree_sub_trajectories.append(child)
+                                    agent.trajectory.add_debug_event({"type": "tree_child_delegation", "iteration": iteration,
+                                        "plan_node_id": node_id, "plan_depth": plan_depth, "child_task_id": child.task_id})
+                                return mediated["payload"], mediated["status"], mediated["executed"]
+                        args = _normalize_action_args(name, args)
+                        try:
+                            result, observation, status, executed = _execute_concrete_tool_call(name, args)
+                        except Exception as exc:
+                            result, status = {"error": str(exc)}, "error"
+                            executed = any(e.get("executed") for e in agent.trajectory.tool_execution_events[start_event:])
+                            _store_result_aliases(name, result)
+                            _remember_execution(tool_name=name, tool_args=_resolve_tool_args(args), raw_result=result,
+                                observation_text=str(exc), observation_status=status, executed=executed,
+                                source="tool" if executed else "system")
+                        for event in agent.trajectory.tool_execution_events[start_event:]:
+                            event.update(plan_depth=plan_depth, plan_node_id=node_id)
+                            if search_id is not None:
+                                event["search_id"] = search_id
+                        return result, status, executed
+                    nodes = action_args.get("nodes", [])
+                    observations = []
+                    if nodes:
+                        result = execute_action_tree(nodes, execute_tree_leaf,
+                            lambda key, value: self.context.set_variable(key, value), settings.max_recursion_depth)
+                        _store_result_aliases("Execute_Plan", result)
+                        observations.append({"tool": "Execute_Plan", "result": result, "status": result["status"]})
+                        agent.trajectory.add_debug_event({"type": "action_tree_execution", "iteration": iteration,
+                            "resolver_depth": depth, "max_plan_depth": result["max_plan_depth"],
+                            "nodes": result["execution_tree"]})
+                    else:
+                        result = {"status": "success", "items": []}
+                    groups = []
+                    if action_name == "Resolver_Turn":
+                        from .resolver_search import run_searches
+                        try:
+                            requests = copy.deepcopy(action_args.get("searches"))
+                            if mediation_mode and requests:
+                                if resolver_search_rounds >= agent.max_iterations:
+                                    agent.trajectory.add_debug_event({"type": "resolver_search_budget_rejected",
+                                        "depth": depth, "iteration": iteration,
+                                        "search_rounds_used": resolver_search_rounds,
+                                        "search_round_limit": agent.max_iterations})
+                                    raise ValueError(
+                                        f"Resolver Search budget exhausted ({resolver_search_rounds}/{agent.max_iterations}). "
+                                        "No further Search is allowed in this node. Complete pending Actions "
+                                        "using available schemas/results, then Return."
+                                    )
+                                resolver_search_rounds += 1
+                                agent.trajectory.add_debug_event({"type": "resolver_search_round",
+                                    "depth": depth, "iteration": iteration, "search_round": resolver_search_rounds,
+                                    "search_round_limit": agent.max_iterations,
+                                    "request_count": len(requests) if isinstance(requests, list) else None})
+                            if isinstance(requests, list):
+                                used_ids = set(resolver_search_results) | {r.get("id") for r in requests if isinstance(r, dict) and isinstance(r.get("id"), str)}
+                                for index, request in enumerate(requests):
+                                    if isinstance(request, dict) and "id" not in request:
+                                        generated = f"auto_{iteration}_{index}"
+                                        while generated in used_ids:
+                                            generated += "_"
+                                        request["id"] = generated
+                                        used_ids.add(generated)
+                            groups = run_searches(requests, registry.get_tool("Tool_Search"), resolver_search_results)
+                            for group in groups:
+                                resolver_search_results[group["search_id"]] = group
+                                agent.trajectory.tool_execution_events.append({
+                                    "event_id": f"{agent.trajectory.task_id}:tool:{len(agent.trajectory.tool_execution_events) + 1}",
+                                    "tool": "Tool_Search", "depth": depth, "iteration": iteration,
+                                    "args": {"intent_description": group["intent_description"], "scopes": group["scopes"], "top_k": 5},
+                                    "search_id": group["search_id"], "executed": True, "status": group["status"],
+                                    "candidate_names": [c.get("name") for c in group["candidates"]],
+                                    "error": group.get("error"), "ranking_method": "embedding_cosine"})
+                                agent.trajectory.tool_execution_events[-1].update(
+                                    dispatch_mode="parallel" if len(groups) > 1 else "serial",
+                                    dispatch_group=f"{agent.trajectory.task_id}:search:{iteration}")
+                            result = {"ActionResults": result, "SearchResults": groups,
+                                      "status": "success" if result["status"] == "success" and all(g["status"] == "success" for g in groups) else "error"}
+                        except ValueError as exc:
+                            result = {"ActionResults": result, "status": "error", "error": str(exc)}
+                    observation, status, _ = format_compact_observation(result, tool_name=action_name)
+                    agent.trajectory.add_step(thought=thought, plan=plan, action=action_name,
+                        action_args=action_args, observation=observation, observation_items=[result],
+                        is_recursive=bool(tree_sub_trajectories), sub_trajectories=tree_sub_trajectories)
+                    _append_assistant_turn(thought, plan, action_name, action_args)
+                    if observations:
+                        _append_observation_json(observations)
+                    if groups:
+                        # Preserve complete, per-request schemas; generic observation compaction loses contracts.
+                        _append_history("user", json.dumps({"SearchResults": groups}, ensure_ascii=False))
+                    elif result.get("error"):
+                        _append_history("user", json.dumps(result, ensure_ascii=False))
+                    continue
+
                 # Handle finish - require explicit answer parameter
                 if action_name.lower() == "finish":
                     if depth > 0:
                         policy_msg = (
                             "Error: only the root planner may emit Finish. "
-                            "Sub-agents must execute a concrete tool instead; successful tool executions return to the parent planner automatically. "
+                            "Sub-agents use Actions to continue or a top-level Return to return the local result to their parent. "
                             "A top-level `Result` note is optional, but it never replaces executable `Actions`."
                         )
                         agent.trajectory.add_step(
@@ -5204,8 +5568,8 @@ class RecursiveEngine:
                     consecutive_parse_failures += 1
                     logger.warning("%s emitted Tool_Search directly; Tool_Search is automatic.", role_label)
                     _append_history("user", (
-                        "Do not output Tool_Search. Tool_Search is automatic engine behavior. "
-                        "Choose the target tool name(s) and fill parameters; the engine will search/validate automatically."
+                        "Use top-level Search, not Tool_Search in Actions. "
+                        "Each Search request needs id, intent_description and scopes; select returned tools in a later Actions turn."
                     ))
                     continue
 
@@ -5233,8 +5597,8 @@ class RecursiveEngine:
                         consecutive_parse_failures += 1
                         logger.warning("%s emitted Tool_Search inside a Parallel batch; Tool_Search is automatic.", role_label)
                         _append_history("user", (
-                            "Do not output Tool_Search. Tool_Search is automatic engine behavior. "
-                            "Output the candidate tool name(s) you want and fill schema-compatible parameters."
+                            "Use top-level Search, not Tool_Search in Actions. "
+                            "Each request needs id, intent_description and scopes; select returned tools with schema-compatible parameters."
                         ))
                         continue
 
@@ -5270,7 +5634,7 @@ class RecursiveEngine:
                                 resolution = _resolve_root_action_via_toolsearch_top1(
                                     abstract_tool=normalized_name,
                                     abstract_args=normalized_args,
-                                    description_text=batch_desc or thought or plan,
+                                    description_text=describe_planner_action(normalized_name, normalized_args, batch_desc, thought or plan),
                                 )
                                 if resolution.get("resolved"):
                                     concrete_parallel_requests.append({
@@ -5403,7 +5767,7 @@ class RecursiveEngine:
                             routed = _auto_route_root_action(
                                 action_name=normalized_name,
                                 action_args=normalized_args,
-                                description_text=_batch_desc or thought or plan,
+                                description_text=describe_planner_action(normalized_name, normalized_args, _batch_desc, thought or plan),
                                 defer_execution=True,
                             )
                             if routed.get("handled"):
@@ -5424,7 +5788,7 @@ class RecursiveEngine:
                                     ),
                                     "planner_action_name": normalized_name,
                                     "planner_action_args": normalized_args,
-                                    "description_text": _batch_desc or thought or plan,
+                                    "description_text": describe_planner_action(normalized_name, normalized_args, _batch_desc, thought or plan),
                                 })
                                 continue
                             delegated_root_calls.append({
@@ -5436,7 +5800,7 @@ class RecursiveEngine:
                                     else normalized_args
                                 ),
                                 "fallback_tool": normalized_name,
-                                "description_text": _batch_desc or thought or plan,
+                                "description_text": describe_planner_action(normalized_name, normalized_args, _batch_desc, thought or plan),
                             })
 
                         for request in _execute_parallel_concrete_tool_calls(deferred_root_calls):
@@ -5585,7 +5949,7 @@ class RecursiveEngine:
                             resolution = _resolve_virtual_subagent_action(
                                 abstract_tool=name,
                                 abstract_args=normalized_args,
-                                description_text=_batch_desc or thought or plan,
+                                description_text=describe_planner_action(normalized_name, normalized_args, _batch_desc, thought or plan),
                             )
                             if resolution.get("resolved"):
                                 concrete_name = str(resolution.get("tool_name", "")).strip()
@@ -5647,6 +6011,11 @@ class RecursiveEngine:
                                         "payload": failure_payload,
                                     }
                                 else:
+                                    try:
+                                        normalized_args = _prepare_child_intent(_batch_desc, normalized_args)
+                                    except ValueError as exc:
+                                        parallel_slots[idx] = {"tool": name, "status": "error", "payload": {"error": str(exc)}}
+                                        continue
                                     any_recursive = True
                                     logger.info(
                                         "%s[Depth %d] Abstract action %s requires recursive delegation; spawning sub-agent.",
@@ -5793,11 +6162,13 @@ class RecursiveEngine:
                         break
                     parallel_items = [item for item in parallel_slots if isinstance(item, dict)]
                     observation, parallel_status, parallel_payload = build_parallel_observation(parallel_items)
-                    any_parallel_success = any(
+                    all_parallel_success = bool(parallel_items) and all(
                         str(item.get("status", "")).lower() == "success"
                         for item in parallel_items
                     )
-                    if mediation_mode and any_parallel_success:
+                    if mediation_mode:
+                        success = all_parallel_success
+                    if mediation_mode and all_parallel_success:
                         _remember_execution(
                             tool_name="Parallel",
                             tool_args=action_args,
@@ -5831,19 +6202,6 @@ class RecursiveEngine:
                     _append_observation_json([
                         {"tool": "Parallel", "status": parallel_status, "result": parallel_payload}
                     ])
-                    if mediation_mode and any_parallel_success:
-                        logger.info(
-                            "%s[Subagent->Planner][Depth %d] Returning immediately after successful parallel execution.",
-                            '  ' * depth,
-                            depth,
-                        )
-                        final_answer = extract_planner_result_text(
-                            parallel_payload,
-                            tool_name="Parallel",
-                        ).strip() or observation
-                        success = True
-                        finished = True
-                        break
                     continue
                 
                 # Standard branch
@@ -5853,7 +6211,7 @@ class RecursiveEngine:
                         resolution = _resolve_root_action_via_toolsearch_top1(
                             abstract_tool=action_name,
                             abstract_args=action_args if isinstance(action_args, dict) else {},
-                            description_text=_sub_desc or thought or plan,
+                            description_text=describe_planner_action(action_name, action_args, _sub_desc, thought or plan),
                         )
                         if resolution.get("resolved"):
                             concrete_name = str(resolution.get("tool_name", action_name)).strip() or action_name
@@ -5950,7 +6308,7 @@ class RecursiveEngine:
                     routed = _auto_route_root_action(
                         action_name=action_name,
                         action_args=action_args if isinstance(action_args, dict) else {},
-                        description_text=_sub_desc or thought or plan,
+                        description_text=describe_planner_action(action_name, action_args, _sub_desc, thought or plan),
                     )
                     if routed.get("handled"):
                         observation = str(routed.get("observation", ""))
@@ -5987,7 +6345,7 @@ class RecursiveEngine:
                             if isinstance(routed.get("delegate_action_args", action_args if isinstance(action_args, dict) else {}), dict)
                             else (action_args if isinstance(action_args, dict) else {})
                         ),
-                        description_text=_sub_desc or thought or plan,
+                        description_text=describe_planner_action(action_name, action_args, _sub_desc, thought or plan),
                     )
                     observation = str(mediated.get("observation", ""))
                     obs_status = str(mediated.get("status", "success"))
@@ -6175,20 +6533,6 @@ class RecursiveEngine:
                         observation_payload=result if obs_status == "success" else {"error": observation},
                     )
                     observation_tool_name = action_name if tool_executed else "System"
-                    if mediation_mode and obs_status == "success":
-                        logger.info(
-                            "%s[Subagent->Planner][Depth %d] Returning immediately after successful tool execution: %s",
-                            '  ' * depth,
-                            depth,
-                            action_name,
-                        )
-                        final_answer = extract_planner_result_text(
-                            result,
-                            tool_name=action_name,
-                        ).strip() or observation
-                        success = True
-                        finished = True
-                        break
                     _append_assistant_turn(thought, plan, action_name, action_args)
                     _append_observation_json([
                         {
@@ -6203,7 +6547,7 @@ class RecursiveEngine:
                     resolution = _resolve_virtual_subagent_action(
                         abstract_tool=action_name,
                         abstract_args=action_args,
-                        description_text=_sub_desc or thought or plan,
+                        description_text=describe_planner_action(action_name, action_args, _sub_desc, thought or plan),
                     )
 
                     if resolution.get("resolved"):
@@ -6294,20 +6638,6 @@ class RecursiveEngine:
                             },
                         )
                         observation_tool_name = concrete_name if tool_executed else "System"
-                        if mediation_mode and obs_status == "success":
-                            logger.info(
-                                "%s[Subagent->Planner][Depth %d] Returning immediately after successful tool execution: %s",
-                                '  ' * depth,
-                                depth,
-                                concrete_name,
-                            )
-                            final_answer = extract_planner_result_text(
-                                result,
-                                tool_name=concrete_name,
-                            ).strip() or observation
-                            success = True
-                            finished = True
-                            break
                         _append_assistant_turn(thought, plan, action_name, action_args)
                         _append_observation_json([
                             {
@@ -6321,7 +6651,7 @@ class RecursiveEngine:
                     failure_payload = dict(resolution.get("observation", {}) or {})
                     failure_payload["abstract_tool"] = action_name
 
-                    if depth > 0:
+                    if depth > 0 and _is_nonrecoverable_resolution_failure(resolution):
                         subagent_toolsearch_failures += 1
                         failure_payload["attempt"] = subagent_toolsearch_failures
                         observation, obs_status, _ = format_compact_observation(
@@ -6410,6 +6740,14 @@ class RecursiveEngine:
                         ])
                         continue
 
+                    if depth > 0:
+                        try:
+                            action_args = _prepare_child_intent(_sub_desc, action_args)
+                        except ValueError as exc:
+                            message = str(exc)
+                            agent.trajectory.add_step(thought=thought, plan=plan, action="Protocol_Error", action_args=action_args, observation=message, observation_items=[{"tool": "System", "status": "error", "result": message}], is_recursive=False)
+                            _append_history("user", message)
+                            continue
                     logger.info(
                         f"{'  ' * depth}[Depth {depth}] Identified high-level abstraction: {action_name}. "
                         f"Spawning sub-agent..."
@@ -6479,20 +6817,6 @@ class RecursiveEngine:
                         observation,
                         observation_payload=sub_payload,
                     )
-                    if mediation_mode and sub_status == "success":
-                        logger.info(
-                            "%s[Subagent->Planner][Depth %d] Returning immediately after recursive sub-agent success: %s",
-                            '  ' * depth,
-                            depth,
-                            resolved_tool or action_name,
-                        )
-                        final_answer = extract_planner_result_text(
-                            sub_payload,
-                            tool_name=str(resolved_tool or action_name),
-                        ).strip() or observation
-                        success = True
-                        finished = True
-                        break
                     _append_assistant_turn(thought, plan, action_name, action_args)
                     _append_observation_json([
                         {
@@ -6588,6 +6912,7 @@ class RecursiveEngine:
                     break
 
                 logger.error(f"{'  ' * depth}Error in iteration {iteration}: {e}")
+                consecutive_iteration_errors += 1
                 observation = f"Error: {error_text}"
                 
                 agent.trajectory.add_step(
@@ -6599,6 +6924,11 @@ class RecursiveEngine:
                 )
                  
                 _append_history("user", f"An error occurred: {observation}\n\nTry a different approach.")
+                if mediation_mode and consecutive_iteration_errors >= MAX_PARSE_FAILURES:
+                    final_answer = "Failed: resolver encountered repeated iteration errors."
+                    success = False
+                    finished = True
+                    break
             finally:
                 trajectory_step_count_after_iteration = len(agent.trajectory.steps)
                 should_yield_turn = (
@@ -6629,12 +6959,18 @@ class RecursiveEngine:
         if isinstance(last_execution_meta, dict):
             last_execution_meta.setdefault("route_refresh_count", route_refresh_count)
             last_execution_meta.setdefault("forced_final_turn_finish", forced_final_turn_retry_used)
+            if mediation_mode:
+                last_execution_meta.update(resolver_search_rounds_used=resolver_search_rounds,
+                                           resolver_search_round_limit=agent.max_iterations)
         if finished and final_answer:
             normalized_final_answer = str(final_answer or "").strip().lower()
             if normalized_final_answer.startswith(("failed:", "error:")):
                 success = False
             return final_answer, success, last_execution_meta
         else:
+            if mediation_mode:
+                last_execution_meta = {**last_execution_meta, "status": "error", "resolver_did_not_return": True}
+                return "Error: resolver_did_not_return.", False, last_execution_meta
             return "Error: max_iterations_reached (planner_never_finished).", False, last_execution_meta
     
     # Observation formatting helpers
@@ -6694,7 +7030,7 @@ class RecursiveEngine:
         context_lines = [
             "Sub-agent mode: decompose abstract function into executable video-task tools.",
             "Do NOT request direct raw caption/transcript/graph context.",
-            "Use abstract tool semantics and prefer runtime-routed candidate resolution over hardcoded favorite tools.",
+            "Use top-level Search to discover unknown executable interfaces; choose scopes and candidates yourself.",
             f"Current Depth: {depth}",
         ]
         return "\n".join(context_lines)
@@ -6713,5 +7049,4 @@ class RecursiveEngine:
         """Reset the engine to initial state."""
         self.context.reset()
         self.root_trajectory = None
-        self._active_executed_tool_signatures = {}
         logger.info("RecursiveEngine reset")

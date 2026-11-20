@@ -103,8 +103,10 @@ _PLANNER_VISUAL_RESULT_KEYS = (
     "image_evidence",
     "image_timestamps",
 )
-_PLANNER_RESULT_ONLY_TOOL_NAMES = {"Video_Clip_QA"}
+_PLANNER_FULL_RESULT_TOOL_NAMES = {"Video_Clip_QA", "Audio_Clip_QA", "Cross_Modal_Verify", "evidence_verify"}
 _PLANNER_VISUAL_TEXT_KEYS = (
+    "image_path",
+    "reused_image",
     "tool",
     "description",
     "action_description",
@@ -135,8 +137,19 @@ def _preserve_full_observations_enabled() -> bool:
     return bool(getattr(settings, "preserve_full_observations", False))
 
 
-def _should_preserve_full_result_for_tool(tool_name: str = "") -> bool:
-    return str(tool_name or "").strip() in _PLANNER_RESULT_ONLY_TOOL_NAMES
+def _should_preserve_full_result_for_tool(tool_name: str = "", payload: Any = None) -> bool:
+    if str(tool_name or "").strip() in _PLANNER_FULL_RESULT_TOOL_NAMES:
+        return True
+    # Parallel observations must also retain their full VideoQA child results.
+    if isinstance(payload, dict):
+        if any(key in payload for key in ("reasoning", "raw_response", "raw_assessment")):
+            return True
+        if str(payload.get("tool", "")).strip() in _PLANNER_FULL_RESULT_TOOL_NAMES:
+            return True
+        return _should_preserve_full_result_for_tool(payload=payload.get("items"))
+    if isinstance(payload, list):
+        return any(_should_preserve_full_result_for_tool(payload=item) for item in payload)
+    return False
 
 
 def _safe_json_loads(value: Any) -> Optional[Any]:
@@ -445,7 +458,7 @@ def _normalize_payload(result: Any, tool_name: str = "") -> Any:
             return parsed
         return {"result": result.strip() or summarize_tool_result(result, tool_name=tool_name)}
 
-    if bool(getattr(settings, "preserve_full_observations", False)) and isinstance(result, (dict, list)):
+    if (_preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name, result)) and isinstance(result, (dict, list)):
         return result
 
     formatted = format_tool_result_observation(result, tool_name=tool_name)
@@ -456,6 +469,8 @@ def _normalize_payload(result: Any, tool_name: str = "") -> Any:
 
 
 def _build_planner_payload(payload: Any, tool_name: str = "") -> Any:
+    if _preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name, payload):
+        return payload
     if isinstance(payload, list):
         return [
             _build_planner_payload(item, tool_name=tool_name)
@@ -488,33 +503,10 @@ def _build_planner_payload(payload: Any, tool_name: str = "") -> Any:
         planner_payload["result"] = planner_result
     elif "result" not in planner_payload:
         planner_payload["result"] = summarize_tool_result(planner_payload, tool_name=tool_name)
-    result_only_payload = _compact_result_only_planner_payload(planner_payload, tool_name=tool_name)
-    if result_only_payload is not None and not _preserve_full_observations_enabled():
-        return result_only_payload
     visual_payload = _compact_visual_planner_payload(planner_payload, tool_name=tool_name)
     if visual_payload is not None:
         return visual_payload
     return planner_payload
-
-
-def _compact_result_only_planner_payload(payload: Any, tool_name: str = "") -> Optional[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return None
-    if str(tool_name or "").strip() not in _PLANNER_RESULT_ONLY_TOOL_NAMES:
-        return None
-
-    compact_payload: Dict[str, Any] = {
-        "result": _extract_planner_result_text_from_payload(payload, tool_name=tool_name)
-        or summarize_tool_result(payload, tool_name=tool_name),
-    }
-    status = infer_observation_status(payload)
-    if status != "success":
-        compact_payload["status"] = status
-    if payload.get("error") not in (None, ""):
-        compact_payload["error"] = str(payload.get("error")).strip()
-    if status != "success" and payload.get("warning") not in (None, ""):
-        compact_payload["warning"] = str(payload.get("warning")).strip()
-    return compact_payload
 
 
 def _compact_visual_planner_payload(payload: Any, tool_name: str = "") -> Optional[Dict[str, Any]]:
@@ -630,7 +622,7 @@ def build_planner_observation_record(
     if final_status == "success" and inferred_status in {"error", "no_valid_result"}:
         final_status = inferred_status
 
-    if _preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name):
+    if _preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name, planner_payload):
         record: Dict[str, Any] = {"tool": tool_name}
         if isinstance(planner_payload, dict):
             for key, value in planner_payload.items():
@@ -645,8 +637,7 @@ def build_planner_observation_record(
 
         if not isinstance(record.get("result"), str) or not str(record.get("result", "")).strip():
             record["result"] = extract_planner_result_text(planner_payload, tool_name=tool_name)
-        if final_status != "success":
-            record["status"] = final_status
+        record["status"] = final_status
         return record
 
     candidate_payloads: List[Any] = [planner_payload]
@@ -687,7 +678,7 @@ def build_planner_observation_record(
         if final_status != "success":
             record["status"] = final_status
         else:
-            record.pop("status", None)
+            record["status"] = final_status
 
         if _serialized_size(record) <= max_chars:
             return record
@@ -696,8 +687,7 @@ def build_planner_observation_record(
         "tool": tool_name,
         "result": _truncate_text(extract_planner_result_text(planner_payload, tool_name=tool_name), max_chars=max(200, max_chars - 80)),
     }
-    if final_status != "success":
-        fallback["status"] = final_status
+    fallback["status"] = final_status
     return fallback
 
 
@@ -708,7 +698,7 @@ def format_compact_observation(
 ) -> Tuple[str, str, Any]:
     payload = _normalize_payload(result, tool_name=tool_name)
     planner_payload = _build_planner_payload(payload, tool_name=tool_name)
-    if _preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name):
+    if _preserve_full_observations_enabled() or _should_preserve_full_result_for_tool(tool_name, planner_payload):
         serialized = (
             planner_payload
             if isinstance(planner_payload, str)

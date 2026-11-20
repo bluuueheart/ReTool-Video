@@ -3,12 +3,37 @@
 from __future__ import annotations
 
 import inspect
+import json
+import os
 import re
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List
 
 from PIL import Image
 from moviepy.video.io.VideoFileClip import VideoFileClip
+
+
+def _asset_workers(env_name: str, default: int, jobs: int) -> int:
+    """Worker count for per-segment asset export; each worker owns its own ffmpeg reader/writer."""
+    try:
+        configured = int(str(os.environ.get(env_name) or "").strip() or default)
+    except ValueError:
+        configured = default
+    return max(1, min(configured, jobs))
+
+
+def run_parallel(fn, jobs: List[tuple], workers: int) -> List[Any]:
+    """Run ``fn(*job)`` for every job in worker processes (moviepy export is GIL-bound, so threads do not scale).
+
+    Spawned, not forked: the parent may already hold CUDA state and background threads.
+    """
+    if workers <= 1 or len(jobs) <= 1:
+        return [fn(*job) for job in jobs]
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+        return [future.result() for future in [pool.submit(fn, *job) for job in jobs]]
 
 
 def build_segment_aliases(video_name: str, segment_id: Any) -> List[str]:
@@ -198,6 +223,10 @@ def export_video_subclip(
                 "codec": "libx264",
                 "logger": None,
             }
+            # Optional faster x264 preset for bulk preprocessing (default keeps moviepy's "medium").
+            encode_preset = str(os.environ.get("TOOLSTAR_CLIP_ENCODE_PRESET", "veryfast") or "").strip()
+            if encode_preset:
+                write_kwargs["preset"] = encode_preset
             if target_fps is not None and float(target_fps) > 0:
                 write_kwargs["fps"] = float(target_fps)
             if getattr(clip_segment, "audio", None) is not None:
@@ -225,6 +254,36 @@ def export_video_subclip(
                 close_segment()
 
 
+def _extract_frame_group(video_path, video_name, output_dir, frames_root, group):
+    """Extract the frames of a run of segments with one reader; returns plain data for the parent to merge."""
+    output_dir = Path(output_dir)
+    frames_root = Path(frames_root)
+    results = []
+    # One reader per worker: moviepy readers are not shareable across threads or processes.
+    with VideoFileClip(video_path) as video:
+        video_duration = float(getattr(video, "duration", 0.0) or 0.0)
+        video_fps = float(getattr(video, "fps", 0.0) or 0.0)
+        max_time = _safe_frame_upper_bound(video_duration, video_fps)
+
+        for seg_id, raw_frame_times in group:
+            frame_times = _normalize_frame_times(raw_frame_times)
+            realized_frame_times: List[float] = []
+            frame_paths: List[str] = []
+            segment_dir = frames_root / seg_id
+            segment_dir.mkdir(parents=True, exist_ok=True)
+
+            for index, timestamp in enumerate(frame_times):
+                safe_time = min(max(0.0, float(timestamp)), max_time)
+                realized_frame_times.append(round(safe_time, 3))
+                frame_path = segment_dir / _frame_filename(index, safe_time)
+                if not frame_path.exists():
+                    frame = video.get_frame(safe_time)
+                    Image.fromarray(frame).save(frame_path, format="JPEG", quality=90)
+                frame_paths.append(frame_path.relative_to(output_dir).as_posix())
+            results.append((seg_id, realized_frame_times, frame_paths, build_segment_aliases(video_name, seg_id)))
+    return results
+
+
 def persist_segment_frame_assets(
     video_path: str,
     video_name: str,
@@ -239,33 +298,35 @@ def persist_segment_frame_assets(
     if not segment_times_info:
         return segment_times_info
 
-    with VideoFileClip(video_path) as video:
-        video_duration = float(getattr(video, "duration", 0.0) or 0.0)
-        video_fps = float(getattr(video, "fps", 0.0) or 0.0)
-        max_time = _safe_frame_upper_bound(video_duration, video_fps)
-
-        for raw_segment_id, info in segment_times_info.items():
-            seg_id = str(raw_segment_id)
-            frame_times = _normalize_frame_times(info.get("frame_times"))
-            realized_frame_times: List[float] = []
-            frame_paths: List[str] = []
-            segment_dir = frames_root / seg_id
-            segment_dir.mkdir(parents=True, exist_ok=True)
-
-            for index, timestamp in enumerate(frame_times):
-                safe_time = min(max(0.0, float(timestamp)), max_time)
-                realized_frame_times.append(round(safe_time, 3))
-                frame_path = segment_dir / _frame_filename(index, safe_time)
-                if not frame_path.exists():
-                    frame = video.get_frame(safe_time)
-                    Image.fromarray(frame).save(frame_path, format="JPEG", quality=90)
-                frame_paths.append(frame_path.relative_to(output_dir).as_posix())
-
+    items = [(str(raw_id), info) for raw_id, info in segment_times_info.items()]
+    by_id = dict(items)
+    workers = _asset_workers("TOOLSTAR_FRAME_EXPORT_WORKERS", 16, len(items))
+    # Contiguous groups keep each reader seeking forward through its own part of the video.
+    size = -(-len(items) // workers)
+    jobs = [
+        (video_path, video_name, str(output_dir), str(frames_root),
+         [(seg_id, info.get("frame_times")) for seg_id, info in items[i:i + size]])
+        for i in range(0, len(items), size)
+    ]
+    for group_result in run_parallel(_extract_frame_group, jobs, workers):
+        for seg_id, realized_frame_times, frame_paths, aliases in group_result:
+            info = by_id[seg_id]
             info["frame_times"] = realized_frame_times
             info["frame_paths"] = frame_paths
-            info["segment_aliases"] = build_segment_aliases(video_name, seg_id)
+            info["segment_aliases"] = aliases
 
     return segment_times_info
+
+
+def _export_clip(video_path, seg_id, start, end, clip_path):
+    clip_path = Path(clip_path)
+    if not _is_materialized_media_file(clip_path):
+        export_video_subclip(video_path=video_path, start=start, end=end, output_path=clip_path)
+    if not _is_materialized_media_file(clip_path):
+        raise RuntimeError(
+            f"Segment {seg_id} clip export did not materialize a usable file at {clip_path} "
+            f"for timestamp ({start}, {end})."
+        )
 
 
 def persist_segment_video_assets(
@@ -281,6 +342,7 @@ def persist_segment_video_assets(
     if not segment_times_info:
         return segment_times_info
 
+    jobs = []
     for raw_segment_id, info in segment_times_info.items():
         seg_id = str(raw_segment_id)
         timestamp = info.get("timestamp", (0.0, 0.0))
@@ -290,16 +352,65 @@ def persist_segment_video_assets(
             )
         start = max(0.0, float(timestamp[0] or 0.0))
         end = max(start, float(timestamp[1] or start))
-        clip_path = clips_root / _clip_filename(seg_id)
+        jobs.append((video_path, seg_id, start, end, str(clips_root / _clip_filename(seg_id))))
 
-        if not _is_materialized_media_file(clip_path):
-            export_video_subclip(video_path=video_path, start=start, end=end, output_path=clip_path)
-        if not _is_materialized_media_file(clip_path):
-            raise RuntimeError(
-                f"Segment {seg_id} clip export did not materialize a usable file at {clip_path} "
-                f"for timestamp ({start}, {end})."
-            )
+    workers = _asset_workers("TOOLSTAR_CLIP_EXPORT_WORKERS", 32, len(jobs))
+    run_parallel(_export_clip, jobs, workers)
 
+    for raw_segment_id, info in segment_times_info.items():
+        clip_path = clips_root / _clip_filename(str(raw_segment_id))
         info["segment_video_path"] = clip_path.relative_to(output_dir).as_posix()
 
     return segment_times_info
+
+
+def lazy_segment_clips_enabled() -> bool:
+    """Segment mp4s are exported on first use (``ensure_segment_clip``) unless TOOLSTAR_LAZY_SEGMENT_CLIPS=0."""
+    return str(os.environ.get("TOOLSTAR_LAZY_SEGMENT_CLIPS", "1")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def plan_segment_video_assets(
+    segment_times_info: Dict[str, Dict[str, Any]],
+    output_dir: Path,
+    clips_subdir: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Record each segment's clip path without exporting it; the file is materialized when a tool needs it."""
+    for raw_segment_id, info in segment_times_info.items():
+        timestamp = info.get("timestamp", (0.0, 0.0))
+        if not isinstance(timestamp, (list, tuple)) or len(timestamp) != 2:
+            raise RuntimeError(
+                f"Segment {raw_segment_id} is missing a valid timestamp tuple; cannot plan planner-grounding clip assets."
+            )
+        info["segment_video_path"] = (Path(clips_subdir) / _clip_filename(str(raw_segment_id))).as_posix()
+    return segment_times_info
+
+
+def ensure_segment_clip(clip_path: str | Path) -> Path | None:
+    """Return ``clip_path`` as an existing file, exporting that one segment from the source video if needed.
+
+    The processed layout is ``<video_dir>/clips/<segment>.mp4`` next to ``segment_times_info.json`` and
+    ``video_metadata.json``, which supply the time window and the source video. Returns None when the clip
+    cannot be produced, so callers can fall back to the full video.
+    """
+    clip = Path(clip_path)
+    if _is_materialized_media_file(clip):
+        return clip
+    video_dir = clip.parent.parent
+    try:
+        times = json.loads((video_dir / "segment_times_info.json").read_text(encoding="utf-8"))
+        times_map = times.get("segment_times_info") or {}
+        metadata = json.loads((video_dir / "video_metadata.json").read_text(encoding="utf-8"))
+        source = str(metadata.get("source_video_path") or "").strip()
+        match = next((v for k, v in times_map.items() if _clip_filename(str(k)) == clip.name), None)
+        timestamp = (match or {}).get("timestamp")
+        if not source or not Path(source).exists() or not isinstance(timestamp, (list, tuple)) or len(timestamp) != 2:
+            return None
+        start = max(0.0, float(timestamp[0] or 0.0))
+        end = max(start, float(timestamp[1] or start))
+        os.environ.setdefault("TOOLSTAR_CLIP_ENCODE_PRESET", "veryfast")
+        partial = clip.with_name(f"{clip.stem}.partial-{os.getpid()}{clip.suffix}")
+        export_video_subclip(video_path=source, start=start, end=end, output_path=partial)
+        os.replace(partial, clip)
+    except Exception:
+        return None
+    return clip if _is_materialized_media_file(clip) else None

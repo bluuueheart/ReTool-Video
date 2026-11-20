@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from mvbench_metadata import DEFAULT_MVBENCH_TASK_SPECS, build_question_block, render_prompt
+from mvbench_metadata import DEFAULT_MVBENCH_TASK_SPECS, build_question_block as build_mvbench_question_block, render_prompt as render_mvbench_prompt
 
 
 MLVU_DEV_TASK_SPECS: Tuple[Tuple[str, str, str], ...] = (
@@ -288,8 +288,8 @@ def load_mvbench_inventory(
     workspaces_root: Path,
 ) -> DatasetInventory:
     prompt_template_path = resolve_path(mix_dir, str(dataset_config.get("prompt_template_path") or "./mvbench_query_prompt.txt"))
-    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../../datasets/MVBench/video"))
-    json_root = resolve_path(mix_dir, str(dataset_config.get("json_root") or "../../../datasets/MVBench/json"))
+    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../datasets/MVBench/video"))
+    json_root = resolve_path(mix_dir, str(dataset_config.get("json_root") or "../../datasets/MVBench/json"))
     allowed_data_types = tuple(str(item) for item in dataset_config.get("allowed_data_types", ["video"]))
     include_task_types = tuple(str(item) for item in dataset_config.get("include_task_types", []))
     prompt_template = load_text(prompt_template_path)
@@ -309,11 +309,11 @@ def load_mvbench_inventory(
         with open(json_path, "r", encoding="utf-8") as handle:
             records = json.load(handle)
         for record_index, record in enumerate(records):
-            question_block, answer_option, answer_text, candidates = build_question_block(record)
+            question_block, answer_option, answer_text, candidates = build_mvbench_question_block(record)
             bound = None
             if use_bound:
                 bound = (float(record["start"]), float(record["end"]))
-            prompt = render_prompt(
+            prompt = render_mvbench_prompt(
                 prompt_template,
                 question_block,
                 task_type=task_type,
@@ -362,7 +362,7 @@ def load_mlvu_inventory(
     workspaces_root: Path,
 ) -> DatasetInventory:
     prompt_template_path = resolve_path(mix_dir, str(dataset_config.get("prompt_template_path") or "./mlvu_query_prompt.txt"))
-    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../../datasets/MLVU/MLVU"))
+    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../datasets/MLVU/MLVU"))
     annotation_root = _resolve_mlvu_annotation_root(
         dataset_root,
         str(dataset_config.get("annotation_root") or "./json"),
@@ -478,7 +478,10 @@ def _build_video_index(
         compact = re.sub(r"[^a-z0-9]+", "", stem)
         if compact:
             aliases.add(compact)
-        for token in re.findall(r"\d+", stem):
+        # Numeric benchmark IDs may be full numbered filenames, never digit
+        # substrings of unrelated YouTube IDs (e.g. 323v_FtWqvo).
+        numbered_name = re.fullmatch(r"(?:video[_-]?)?(\d+)", stem)
+        for token in ([numbered_name.group(1)] if numbered_name else []):
             aliases.add(token)
             try:
                 normalized = str(int(token))
@@ -927,7 +930,6 @@ def _resolve_videomme_video_path(
     video_id = _coerce_optional_text(item.get("video_id"))
     candidate_keys: List[str] = []
     for value in (
-        video_id,
         _extract_videomme_external_video_id(item.get("videoID")),
         _extract_videomme_external_video_id(item.get("videoId")),
         _extract_videomme_external_video_id(item.get("youtube_id")),
@@ -937,6 +939,13 @@ def _resolve_videomme_video_path(
         normalized_value = _coerce_optional_text(value).lower()
         if normalized_value and normalized_value not in candidate_keys:
             candidate_keys.append(normalized_value)
+    # Explicit annotation IDs and ID-map aliases take priority over local
+    # numbered-file fallback. A numeric ID must not override the official pair.
+    for alias in video_id_aliases.get(video_id, ()):
+        if alias and alias.lower() not in candidate_keys:
+            candidate_keys.append(alias.lower())
+    if video_id.lower() not in candidate_keys:
+        candidate_keys.append(video_id.lower())
     if video_id.isdigit():
         normalized_numeric = str(int(video_id))
         for value in (normalized_numeric, f"{int(video_id):03d}", f"{int(video_id):04d}"):
@@ -965,7 +974,7 @@ def load_videomme_inventory(
     workspaces_root: Path,
 ) -> DatasetInventory:
     prompt_template_path = resolve_path(mix_dir, str(dataset_config.get("prompt_template_path") or "./videomme_query_prompt.txt"))
-    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../../datasets/Video-MME"))
+    dataset_root = resolve_path(mix_dir, str(dataset_config.get("dataset_root") or "../../datasets/Video-MME"))
     annotation_path = resolve_dataset_child(dataset_root, str(dataset_config.get("annotation_path") or "./evaluation/output_test_template.json"))
     search_roots = [
         resolve_dataset_child(dataset_root, str(item))

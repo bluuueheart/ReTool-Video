@@ -222,7 +222,9 @@ class FoldMemory(BaseTool):
             blocked_action_signatures=blocked_signatures,
             next_allowed_tools=live_next_allowed,
         )
-        memory_state = self._compress_long_sections(memory_state, evidence_candidates, llm=llm)
+        generation_details = {}
+        memory_state = self._compress_long_sections(memory_state, evidence_candidates, llm=llm,
+                                                   generation_details=generation_details)
 
         compressed_summary = (
             f"Folded {len(to_fold)} messages into structured memory state. "
@@ -230,6 +232,7 @@ class FoldMemory(BaseTool):
             f"failed_actions={len(memory_state['failed_actions'])}, gaps={len(memory_state['missing_evidence'])}."
         )
         result = {
+            **generation_details,
             "compressed": True,
             "original_length": len(parsed_messages),
             "compression_ratio": len(to_fold) / len(parsed_messages) if parsed_messages else 0.0,
@@ -665,6 +668,7 @@ class FoldMemory(BaseTool):
         evidence_candidates: List[Dict[str, str]],
         *,
         llm: Any = None,
+        generation_details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         state = self._normalize_state(memory_state)
         candidates = [item for item in evidence_candidates if isinstance(item, dict) and str(item.get("text", "")).strip()]
@@ -699,12 +703,15 @@ class FoldMemory(BaseTool):
             max_fold_tokens = int(
                 settings.fold_memory_generation_config.get("max_new_tokens", 768) or 768
             )
-            response = llm.generate(
+            from toolkit.model_results import generate_model_result
+            generation = generate_model_result(llm,
                 messages,
                 max_tokens=max_fold_tokens,
                 temperature=0.0,
             )
-            parsed = _safe_json_loads(response)
+            if generation_details is not None:
+                generation_details.update({key: generation[key] for key in ("raw_response", "reasoning", "reasoning_available")})
+            parsed = generation["parsed_json"]
             if not isinstance(parsed, dict):
                 return state
             for key in ("found_facts", "missing_evidence", "recent_relevant_observations"):

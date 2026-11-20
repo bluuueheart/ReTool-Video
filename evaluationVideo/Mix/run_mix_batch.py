@@ -105,6 +105,27 @@ def parse_args() -> argparse.Namespace:
         help="Import already-correct existing per-sample results into progress state before scheduling.",
     )
     parser.add_argument(
+        "--sample-uids",
+        default="",
+        help="Only run these sample_uids: comma-separated list, or @path to a file with one uid per line.",
+    )
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        help="Serve every LLM/VLM role (planner, Resolver/subagent, preprocess, visual QA) from local vLLM replicas "
+        "started (or reused) on the visible GPUs. ",
+    )
+    parser.add_argument(
+        "--vllm-urls",
+        default="",
+        help="Use an already running vLLM pool (comma-separated http://host:port/v1) instead of starting replicas.",
+    )
+    parser.add_argument(
+        "--keep-vllm",
+        action="store_true",
+        help="Do not stop the vLLM replicas started by --vllm when this run exits.",
+    )
+    parser.add_argument(
         "--worker-sample-uid",
         default="",
         help=argparse.SUPPRESS,
@@ -361,10 +382,23 @@ def import_skip_true_state(
     return imported
 
 
+def _parse_sample_uid_filter(raw_value: str) -> Optional[Set[str]]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("@"):
+        items = Path(raw[1:]).read_text(encoding="utf-8").splitlines()
+    else:
+        items = raw.split(",")
+    uids = {item.strip() for item in items if item.strip() and not item.strip().startswith("#")}
+    return uids or None
+
+
 def _build_inventory_pending_sequence(
     *,
     inventory: DatasetInventory,
     progress_payload: Mapping[str, Any],
+    allowed_uids: Optional[Set[str]] = None,
 ) -> List[MixSample]:
     pending_by_subset: Dict[str, Deque[MixSample]] = {}
     pending_totals: Dict[str, int] = {}
@@ -375,6 +409,7 @@ def _build_inventory_pending_sequence(
             sample
             for sample in inventory.samples_by_subset.get(subset_name, ())
             if not has_participated(progress_payload, sample.sample_uid)
+            and (allowed_uids is None or sample.sample_uid in allowed_uids)
         )
         if not subset_pending:
             continue
@@ -414,6 +449,7 @@ def build_execution_queue(
     inventories: Sequence[DatasetInventory],
     progress_payload: Mapping[str, Any],
     max_samples: Optional[int],
+    allowed_uids: Optional[Set[str]] = None,
 ) -> List[MixSample]:
     pending: List[MixSample] = []
     pending_by_dataset: Dict[str, Deque[MixSample]] = {}
@@ -425,6 +461,7 @@ def build_execution_queue(
             _build_inventory_pending_sequence(
                 inventory=inventory,
                 progress_payload=progress_payload,
+                allowed_uids=allowed_uids,
             )
         )
         if not dataset_name or not dataset_pending:
@@ -491,7 +528,7 @@ def _build_metrics_from_reward_helper(sample: MixSample, run_result: Mapping[str
         run_result=run_result,
         trajectory=trajectory,
         final_answer=final_answer,
-        ground_truth=sample.ground_truth,
+        ground_truth=sample.ground_truth_option or sample.ground_truth,
         options=sample.options,
         dataset_name=sample.dataset_name,
     )
@@ -632,6 +669,14 @@ def _visible_cuda_device_ids() -> List[str]:
     return []
 
 
+def _workers_per_gpu() -> int:
+    """Sample workers per visible GPU (workers mostly wait on the shared vLLM servers, so >1 overlaps them)."""
+    try:
+        return max(1, int(os.environ.get("TOOLSTAR_WORKERS_PER_GPU", "1") or 1))
+    except ValueError:
+        return 1
+
+
 def _resolve_effective_parallel_samples(
     *,
     configured_parallel_samples: Optional[int],
@@ -641,7 +686,7 @@ def _resolve_effective_parallel_samples(
 ) -> int:
     if selected_count <= 1:
         return 1
-    max_parallel = len(list(visible_device_ids)) if visible_device_ids else 1
+    max_parallel = (len(list(visible_device_ids)) if visible_device_ids else 1) * _workers_per_gpu()
     requested = cli_parallel_samples if cli_parallel_samples is not None else configured_parallel_samples
     if requested is None:
         return max(1, min(selected_count, max_parallel))
@@ -831,6 +876,8 @@ def run_single_sample(
     launcher_log_path = workspace_root / "launcher.log"
     sample_result_path = workspace_root / SAMPLE_RESULT_FILENAME
     _cleanup_workspace(workspace_root)
+    from core.llm.inference_metrics import configure_sample
+    configure_sample(workspace_root / "logs", sample.sample_uid)
 
     started_at = time.perf_counter()
     run_result_payload: Dict[str, Any] = {}
@@ -1253,7 +1300,8 @@ def _execute_parallel_samples(
         for name in config.dataset_order
         if bool(config.datasets.get(name, {}).get("enabled", True))
     ]
-    available_devices: Deque[str] = deque(list(visible_device_ids)[:effective_parallel_samples])
+    slots = [device for _ in range(_workers_per_gpu()) for device in visible_device_ids]
+    available_devices: Deque[str] = deque(slots[:effective_parallel_samples])
     ordered_dataset_names, pending_by_dataset = _split_pending_samples_by_dataset(selected_samples, dataset_order)
     active_tasks: Dict[concurrent.futures.Future[Dict[str, Any]], Tuple[MixSample, RunningSampleTask]] = {}
     active_cache_keys: Set[str] = set()
@@ -1371,6 +1419,47 @@ def _run_worker_mode(args: argparse.Namespace) -> None:
     print(RUN_RESULT_LOG_MARKER + json.dumps(result_item, ensure_ascii=False), flush=True)
 
 
+def _setup_vllm_backend(args: argparse.Namespace, visible_device_ids: Sequence[str]) -> None:
+    """Point every LLM role at vLLM (env is inherited by sample worker subprocesses)."""
+    project_root = str(_retool_video_root().resolve())
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from config.settings import settings
+
+    urls = str(args.vllm_urls or os.environ.get("TOOLSTAR_VLLM_BASE_URLS") or "").strip()
+    wanted = bool(args.vllm or args.vllm_urls or str(os.environ.get("TOOLSTAR_LLM_BACKEND", "")).strip().lower() == "vllm")
+    if not wanted:
+        return
+    if args.vllm and not urls:
+        import vllm_pool
+
+        devices = list(visible_device_ids) or os.environ.get("TOOLSTAR_ALLOWED_GPUS", "0").split(",")
+        pool_plan = vllm_pool.ensure_pool(
+            devices,
+            model=str(Path(settings.planner_model_path).resolve()),
+            stop_on_exit=not (args.keep_vllm or str(os.environ.get("TOOLSTAR_VLLM_KEEP", "")).strip() in {"1", "true"}),
+            needed_workers=None,  # bring up a replica on every visible card
+        )
+        urls = pool_plan["base_urls"]
+        os.environ["TOOLSTAR_VLLM_PLAN"] = str(vllm_pool.plan_path())
+        os.environ["TOOLSTAR_VLLM_MODEL"] = str(pool_plan.get("served_name") or "qwen35-9b")
+        os.environ["TOOLSTAR_VLLM_MODEL_PATH"] = str(pool_plan.get("model_path") or "")
+        LOGGER.info(
+            "vLLM pool: %s",
+            {r["device"]: f"port={r['port']} max_len={r['max_model_len']}" for r in pool_plan["replicas"]},
+        )
+    os.environ["TOOLSTAR_LLM_BACKEND"] = "vllm"
+    os.environ["TOOLSTAR_VLLM_BASE_URLS"] = urls
+    os.environ.setdefault("TOOLSTAR_VLLM_MODEL_PATH", str(Path(settings.planner_model_path).resolve()))
+    LOGGER.info(
+        "LLM backend=vllm base_urls=%s served_model=%s planner_max_tokens=%s max_input_tokens=%s",
+        urls,
+        os.environ.get("TOOLSTAR_VLLM_MODEL", "qwen35-9b"),
+        settings.planner_max_generation_tokens,
+        settings.max_input_tokens,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if str(args.worker_sample_uid or "").strip():
@@ -1397,12 +1486,14 @@ def main() -> None:
         inventories=inventories,
         progress_payload=progress_payload,
         max_samples=args.max_samples,
+        allowed_uids=_parse_sample_uid_filter(args.sample_uids),
     )
 
     if not selected_samples:
         raise RuntimeError("No runnable Mix samples remain after applying progress state and CLI filters.")
 
     visible_device_ids = _visible_cuda_device_ids()
+    _setup_vllm_backend(args, visible_device_ids)
     effective_parallel_samples = _resolve_effective_parallel_samples(
         configured_parallel_samples=config.parallel_samples,
         cli_parallel_samples=args.parallel_samples,

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import threading
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -17,6 +18,7 @@ from config.device_config import detect_device, initialize_device, get_accelerat
 from config.settings import settings
 from core.accelerator_queue import SharedAcceleratorQueueLock, resolve_local_accelerator_slot_key
 from runtime.session import runtime_session
+from core.llm.inference_metrics import metered_stage
 from core.sidecar_pool import (
     OpenAIEndpointPool,
     embeddings_api_marked_unhealthy,
@@ -29,6 +31,7 @@ from toolkit.base import BaseTool, enrich_tool_result, infer_primary_tool_type
 logger = logging.getLogger(__name__)
 _SEGMENT_COUNT_CACHE: Dict[str, int] = {}
 _TOOL_SEARCH_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+_TOOL_SEARCH_CACHE_LOCK = threading.RLock()
 _TIMESTAMPED_TRANSCRIPT_LINE_RE = re.compile(
     r"^\[(?P<start>\d+(?:\.\d+)?)s\s*->\s*(?P<end>\d+(?:\.\d+)?)s\]\s*(?P<text>.*\S)\s*$",
     flags=re.MULTILINE,
@@ -381,6 +384,7 @@ def _normalize_evidence_items(raw_items: Any) -> List[Dict[str, str]]:
                 "label": label,
                 "value": value,
                 "citation": citation,
+                "quote": str(item.get("quote") or "").strip(),
                 "evidence_status": status,
             }
         )
@@ -454,6 +458,8 @@ def _build_evidence_verify_prompt(
     evidence_items: List[Dict[str, str]],
     answer_draft: str,
     verification_prompt: str,
+    options: Any = None,
+    observations: Any = None,
 ) -> str:
     evidence_text = _serialize_for_prompt(evidence_items, max_chars=8000) or "[]"
     context_text = planner_context_text or "[empty]"
@@ -465,7 +471,12 @@ def _build_evidence_verify_prompt(
     return "\n\n".join(
         [
             "You are validating a planner's evidence chain for a local-video QA system.",
-            "Use only the provided question, planner context, evidence list, and answer draft.",
+            "Planner context is a set of claims, not trusted tool output. Only Runtime Observations are executed tool results. "
+            "Check every option independently as supported/refuted/unknown, citing exact observation IDs or image paths. "
+            "A resolved citation proves source existence, not that its claimed value is correct. "
+            "Check initial whole-video versus local evidence conflicts. A local frame cannot refute an event elsewhere, "
+            "a full-video count, order, or absence claim. Report conflicts with citations and scope explanations. "
+            "Do not finish with missing citations, unresolved conflicts, or an unsupported answer.",
             extra_instruction,
             "Return strict JSON with this schema only:",
             json.dumps(
@@ -479,6 +490,8 @@ def _build_evidence_verify_prompt(
                     "logic_issues": ["short concrete issue"],
                     "missing_evidence": ["missing fact or citation"],
                     "recommendation": "one concise action-oriented recommendation",
+                    "option_assessments": [{"option": "A", "verdict": "supported|refuted|unknown", "citations": ["observation ID"], "reasoning": "source-grounded explanation"}],
+                    "conflicts": [{"citations": ["initial:whole_video_qa", "observation ID"], "issue": "scope or content conflict", "resolved": False}],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -486,6 +499,8 @@ def _build_evidence_verify_prompt(
             f"[Original Question]\n{original_question}",
             f"[Planner Context]\n{context_text}",
             f"[Evidence Items]\n{evidence_text}",
+            f"[Answer Options]\n{_serialize_for_prompt(options)}",
+            f"[Runtime Observations]\n{_serialize_for_prompt(observations, max_chars=36000)}",
             f"[Current Answer Draft]\n{answer_text}",
         ]
     ).strip()
@@ -804,6 +819,10 @@ def _extract_declared_task_type(intent_description: str) -> str:
 def _intent_route_features(intent_description: str) -> Dict[str, bool]:
     text = " ".join(str(intent_description or "").strip().lower().split())
     declared_task_type = _extract_declared_task_type(intent_description).lower()
+    structured_operation = any(token in text for token in (
+        "boolean", "logical", "existing flags", "sort", "filter", "deduplic", "median", "percentile",
+        "topk", "top-k", "bottomk", "sql", "structured data", "existing records", "already extracted",
+    ))
     count_reasoning = any(token in text for token in ("how many", "count", "times", "number of"))
     action_localization = any(
         token in text
@@ -850,11 +869,12 @@ def _intent_route_features(intent_description: str) -> Dict[str, bool]:
         "verification": any(token in text for token in ("verify", "confirm", "cross modal", "consisten", "contradict", "check whether")),
         "rewrite": any(token in text for token in ("rewrite", "decompose", "normalize", "expand", "clarify")),
         "compute": any(token in text for token in ("calculate", "count", "total", "sum", "ratio", "compare")),
+        "structured_operation": structured_operation,
         "count_reasoning": count_reasoning,
         "action_localization": action_localization,
         "object_existence": object_existence,
         "egocentric_navigation": egocentric_navigation,
-        "needs_meta_companion": count_reasoning or action_localization or any(
+        "needs_meta_companion": structured_operation or count_reasoning or action_localization or any(
             token in declared_task_type
             for token in ("action count", "moving count", "object interaction", "state change")
         ),
@@ -909,7 +929,7 @@ def _tool_specific_route_bonus(tool_name: str, intent_description: str) -> Tuple
         "state changes", "compare", "comparison", "camera wearer", "first person",
     )
 
-    is_action_query = any(marker in text for marker in action_markers)
+    is_action_query = any(re.search(r"\b" + re.escape(marker) + r"\b", text) for marker in action_markers)
     is_text_query = any(marker in text for marker in text_markers)
     is_tracking_query = any(marker in text for marker in tracking_markers)
     is_clip_reasoning_query = any(marker in text for marker in clip_reasoning_markers)
@@ -917,6 +937,24 @@ def _tool_specific_route_bonus(tool_name: str, intent_description: str) -> Tuple
 
     bonus = 0.0
     reasons: List[str] = []
+    audio_probe = any(marker in text for marker in (
+        "listen", "hear", "raw audio", "sound event", "singing", "vocal tone",
+        "音频", "听到", "唱歌", "声音事件",
+    ))
+    speaker_probe = any(marker in text for marker in ("diariz", "speaker separation", "who spoke", "说话人分离"))
+    if audio_probe:
+        if normalized_tool == "Audio_Clip_QA":
+            bonus += 4.5
+            reasons.append("raw-audio question requires an audio-capable backend")
+        elif normalized_tool == "Audio_Event_Detect":
+            bonus += 2.5
+            reasons.append("audio event candidate scoring reads the actual waveform")
+        elif normalized_tool == "Video_Clip_QA":
+            bonus -= 2.5
+            reasons.append("visual-only VideoQA does not hear the raw audio")
+    if speaker_probe and normalized_tool == "Speaker_Diarization":
+        bonus += 4.5
+        reasons.append("intent explicitly requests raw-audio speaker separation")
     if is_action_query:
         if normalized_tool == "Action_Recognition":
             bonus += 2.2
@@ -969,6 +1007,14 @@ def _route_candidate_bonus(
     grounded_local_evidence = _intent_requires_grounded_local_evidence(features)
     route_score = 0.0
     reasons: List[str] = []
+    from toolkit.tool_aliases import legacy_names_for
+    explicit_names = [tool_name, *legacy_names_for(tool_name)]
+    if any(re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", intent_description, flags=re.IGNORECASE) for name in explicit_names):
+        route_score += 5.0
+        reasons.append("intent names this tool or its merged legacy capability")
+    if features["structured_operation"] and tool_type == "meta":
+        route_score += 1.5
+        reasons.append("intent operates on existing structured data or logical values")
     sparse_scope, segment_count = _is_sparse_segment_scope()
 
     if features["tool_discovery"]:
@@ -1008,7 +1054,7 @@ def _route_candidate_bonus(
         route_score += 0.7
         reasons.append("intent includes temporal/segment cues")
     if features["count_reasoning"]:
-        if tool_type == "meta" and tagset & {"count", "aggregation", "group", "time", "merge", "window"}:
+        if tool_type == "meta" and tagset & {"count", "aggregation", "group"}:
             route_score += 2.2
             reasons.append("count-style query benefits from meta aggregation/time tools")
         elif route_family in {"direct_evidence", "evidence_retrieval"}:
@@ -1021,7 +1067,7 @@ def _route_candidate_bonus(
         elif route_family in {"evidence_retrieval", "direct_evidence"}:
             route_score += 1.35
             reasons.append("action localization needs time-window refinement")
-        if tool_type == "meta" and tagset & {"time", "merge", "window"}:
+        if features["structured_operation"] and tool_type == "meta" and tagset & {"time", "merge", "window"}:
             route_score += 1.5
             reasons.append("action localization benefits from time-range meta tools")
     if features["object_existence"]:
@@ -1224,8 +1270,10 @@ def _select_diverse_candidates(candidates: List[Dict[str, Any]], top_k: int) -> 
 
 
 def _tool_schema_text(tool: BaseTool) -> str:
+    from toolkit.tool_aliases import legacy_names_for
     return (
         f"name: {tool.name}\n"
+        f"legacy capability names: {', '.join(legacy_names_for(tool.name))}\n"
         f"description: {tool.description}\n"
         f"tags: {', '.join(tool.tags or [])}\n"
         f"parameters: {json.dumps(tool.parameters, ensure_ascii=False, sort_keys=True)}"
@@ -1289,57 +1337,14 @@ def _score_tool_search_records(
         else:
             score = float(torch.dot(query_vec, tool_vec).item())
         schema["score"] = score
-        route_meta = _route_candidate_bonus(
-            schema,
-            intent_description=intent_description,
-            recent_tools=recent_tools,
-        )
-        schema.update(route_meta)
-        schema["final_score"] = round(
-            float(score)
-            + float(route_meta.get("route_score", 0.0))
-            + float(route_meta.get("novelty_score", 0.0)),
-            4,
-        )
+        schema["final_score"] = score
+        schema["ranking_method"] = "embedding_cosine"
         scored.append(schema)
     scored.sort(
         key=lambda item: float(item.get("final_score", item.get("score", 0.0)) or 0.0),
         reverse=True,
     )
     return scored
-
-
-def _stage_two_meta_budget(tool_type: str, features: Dict[str, bool], top_k: int) -> int:
-    if tool_type == "meta":
-        return max(1, int(top_k))
-    if tool_type != "all":
-        return 0
-    if not features.get("needs_meta_companion"):
-        return 0
-    return min(max(1, int(top_k) // 2), 3)
-
-
-def _interleave_tool_search_stages(
-    *,
-    primary_items: List[Dict[str, Any]],
-    meta_items: List[Dict[str, Any]],
-    top_k: int,
-) -> List[Dict[str, Any]]:
-    merged: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in primary_items:
-        name = str(item.get("name", "")).strip()
-        if name and name not in seen:
-            item["route_stage"] = "primary_base"
-            merged.append(item)
-            seen.add(name)
-    for item in meta_items:
-        name = str(item.get("name", "")).strip()
-        if name and name not in seen:
-            item["route_stage"] = "meta_companion"
-            merged.append(item)
-            seen.add(name)
-    return merged[: max(1, top_k)]
 
 
 def _get_cached_vector_store(video_dir: Path):
@@ -1429,6 +1434,12 @@ def _ensure_knowledge_graph_payload(video_dir: Path) -> Dict[str, Any]:
 
 
 def _load_segment_graph_entities(video_dir: Path) -> Dict[str, List[str]]:
+    # The per-segment graph annotations are optional. With graph_enable=False (default) the Graph_* tools are
+    # hidden, so do not spend an LLM pass per segment to build a knowledge graph just to decorate retrieval results.
+    from config.settings import settings
+
+    if not bool(getattr(settings, "graph_enable", False)):
+        return {}
     try:
         kg = _ensure_knowledge_graph_payload(video_dir)
     except Exception as exc:
@@ -1623,7 +1634,8 @@ def _build_segment_bundle(
         if value in (None, "", [], {}):
             continue
         entry[key] = value
-    return entry
+    from toolkit.time_utils import annotate_indexed_segment_time
+    return annotate_indexed_segment_time(entry, source="preprocessed_segment_index")
 
 
 def _normalize_embedding_provider_name(provider: Any) -> str:
@@ -1896,6 +1908,13 @@ class _ToolSearchEmbedder:
         return torch.nn.functional.normalize(vector, p=2, dim=0)
 
     def encode(self, text: str) -> torch.Tensor:
+        if self._service_enabled:
+            return self._encode(text)
+        # Local model loading/inference shares mutable model and accelerator state.
+        with _TOOL_SEARCH_CACHE_LOCK:
+            return self._encode(text)
+
+    def _encode(self, text: str) -> torch.Tensor:
         normalized_text = (text or "").strip()
         if not normalized_text:
             return torch.zeros(1, dtype=torch.float32)
@@ -1966,6 +1985,28 @@ def _get_tool_search_embedder(model_path: str) -> _ToolSearchEmbedder:
     return _TOOL_SEARCH_EMBEDDER
 
 
+def tool_search_function_categories(tools=None) -> List[str]:
+    """Existing functional tags, independent of the base/meta classification."""
+    if tools is None:
+        from toolkit.registry import registry
+        tools = registry.get_searchable_tools()
+    return sorted({str(tag).lower() for tool in tools for tag in tool.tags or []
+                   if str(tag).lower() not in {"base", "meta", "biz", "full"}})
+
+
+def filter_tool_search_scopes(tools, scopes):
+    if not isinstance(scopes, list) or not scopes or any(not isinstance(s, str) for s in scopes):
+        raise ValueError("scopes must be a non-empty list of base, meta, full or function:<category>")
+    allowed = {"base", "meta", "full"} | {"function:" + tag for tag in tool_search_function_categories(tools)}
+    invalid = set(scopes) - allowed
+    if invalid:
+        raise ValueError(f"Unknown search scopes: {sorted(invalid)}")
+    if "full" in scopes:
+        return tools
+    return [tool for tool in tools if infer_primary_tool_type(tool.tags) in scopes or
+            any("function:" + str(tag).lower() in scopes for tag in tool.tags or [])]
+
+
 class ToolSearch(BaseTool):
     """Search for relevant tools based on intent description."""
     
@@ -2004,17 +2045,23 @@ class ToolSearch(BaseTool):
                 "enum": ["base", "meta", "all"],
                 "description": "Primary tool class filter. Use base for executable/base tools, meta for atomic/meta tools, all for both.",
                 "default": "all"
+            },
+            "scopes": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Union of base/meta/full and function:<existing functional tag>."
             }
         },
         "required": ["intent_description"]
     }
     
+    @metered_stage("discovery", tool="Tool_Search")
     def run(
         self,
         intent_description: str,
         top_k: int = 5,
         tags: Optional[List[str]] = None,
         tool_type: str = "all",
+        scopes: Optional[List[str]] = None,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Execute tool search.
@@ -2036,10 +2083,11 @@ class ToolSearch(BaseTool):
         if normalized_type not in {"base", "meta", "all"}:
             normalized_type = "all"
 
-        all_tools = registry.get_all_tools(tags=tags)
-        if not _intent_requests_tool_discovery(intent_description):
-            all_tools = [tool for tool in all_tools if tool.name != "Tool_Search"]
-        all_tools = [tool for tool in all_tools if tool.name != "Finish"]
+        all_tools = registry.get_searchable_tools(tags=tags)
+        if scopes is not None:
+            scoped_names = {tool.name for tool in filter_tool_search_scopes(all_tools, scopes)}
+            normalized_type = "all"  # Explicit scopes are a union, never a hidden intersection.
+        all_tools = [tool for tool in all_tools if tool.name not in {"Finish", "Tool_Search"}]
         hidden_names = {
             tool.name
             for tool in all_tools
@@ -2056,15 +2104,15 @@ class ToolSearch(BaseTool):
             return []
 
         recent_tools = runtime_session.get_recent_tools(limit=8)
-        features = _intent_route_features(intent_description)
         try:
-            embedder = _get_tool_search_embedder(self.model_path)
+            with _TOOL_SEARCH_CACHE_LOCK:
+                embedder = _get_tool_search_embedder(self.model_path)
+                schema_records = _get_tool_search_schema_records(
+                    model_path=self.model_path, tools=all_tools)
             query_vec = embedder.encode(intent_description)
-            schema_records = _get_tool_search_schema_records(
-                model_path=self.model_path,
-                tools=all_tools,
-            )
             filtered_records = list(schema_records)
+            if scopes is not None:
+                filtered_records = [r for r in filtered_records if r["schema"]["name"] in scoped_names]
             if normalized_type != "all":
                 filtered_records = [
                     record
@@ -2074,108 +2122,21 @@ class ToolSearch(BaseTool):
             if not filtered_records:
                 return []
 
-            base_records = [
-                record
-                for record in filtered_records
-                if str((record.get("schema") or {}).get("tool_type", "")).strip() == "base"
-            ]
-            meta_records = [
-                record
-                for record in filtered_records
-                if str((record.get("schema") or {}).get("tool_type", "")).strip() == "meta"
-            ]
-
-            if normalized_type == "meta":
-                meta_scored = _score_tool_search_records(
-                    records=meta_records,
-                    intent_description=intent_description,
-                    recent_tools=recent_tools,
-                    query_vec=query_vec,
-                )
-                results = _select_diverse_candidates(meta_scored, top_k=max(1, top_k))
-            elif normalized_type == "base":
-                base_scored = _score_tool_search_records(
-                    records=base_records,
-                    intent_description=intent_description,
-                    recent_tools=recent_tools,
-                    query_vec=query_vec,
-                )
-                results = _select_diverse_candidates(base_scored, top_k=max(1, top_k))
-            else:
-                meta_budget = _stage_two_meta_budget(normalized_type, features, top_k=max(1, top_k))
-                base_budget = max(1, int(top_k) - meta_budget)
-                base_scored = _score_tool_search_records(
-                    records=base_records or filtered_records,
-                    intent_description=intent_description,
-                    recent_tools=recent_tools,
-                    query_vec=query_vec,
-                )
-                primary_results = _select_diverse_candidates(
-                    base_scored,
-                    top_k=max(1, base_budget),
-                )
-                meta_results: List[Dict[str, Any]] = []
-                if meta_budget > 0 and meta_records:
-                    meta_scored = _score_tool_search_records(
-                        records=meta_records,
-                        intent_description=intent_description,
-                        recent_tools=recent_tools,
-                        query_vec=query_vec,
-                    )
-                    meta_results = _select_diverse_candidates(
-                        meta_scored,
-                        top_k=max(1, meta_budget),
-                    )
-                if not primary_results and meta_records:
-                    primary_results = meta_results
-                    meta_results = []
-                results = _interleave_tool_search_stages(
-                    primary_items=primary_results,
-                    meta_items=meta_results,
-                    top_k=max(1, top_k),
-                )
+            # All eligible tools compete in one ranking; tool_type is only a filter.
+            scored = _score_tool_search_records(
+                records=filtered_records,
+                intent_description=intent_description,
+                recent_tools=recent_tools,
+                query_vec=query_vec,
+            )
+            results = scored[:max(1, top_k)]
             logger.info(
-                "Tool_Search semantic retrieval returned %d/%d tools for intent='%s' using %s (recent_tools=%s, tool_type=%s, stage2_meta=%s)",
-                len(results),
-                len(all_tools),
-                intent_description,
-                self.model_path,
-                recent_tools,
-                normalized_type,
-                _stage_two_meta_budget(normalized_type, features, top_k=max(1, top_k)),
+                "Tool_Search returned %d/%d tools for intent='%s' (tool_type=%s, no class quotas)",
+                len(results), len(all_tools), intent_description, normalized_type,
             )
             return results
         except Exception as e:
-            logger.warning(
-                "Tool_Search semantic retrieval failed (%s). Falling back to keyword matching.",
-                e,
-            )
-            words = [w for w in intent_description.lower().split() if w]
-            fallback_results = []
-            fallback_tool_pool = (
-                all_tools
-                if normalized_type == "all"
-                else [tool for tool in all_tools if _infer_tool_type(tool.tags) == normalized_type]
-            )
-            for tool in fallback_tool_pool:
-                desc = (tool.description or "").lower()
-                name = (tool.name or "").lower()
-                if any(word in desc or word in name for word in words):
-                    schema = tool.get_schema()
-                    schema["tags"] = list(tool.tags or [])
-                    schema["tool_type"] = _infer_tool_type(tool.tags)
-                    schema["capability_tier"] = _infer_tool_capability_tier(tool.tags)
-                    schema["evaluation_ready"] = _is_evaluation_ready(tool.tags)
-                    route_meta = _route_candidate_bonus(
-                        schema,
-                        intent_description=intent_description,
-                        recent_tools=recent_tools,
-                    )
-                    schema.update(route_meta)
-                    schema["final_score"] = round(float(route_meta.get("route_score", 0.0)) + float(route_meta.get("novelty_score", 0.0)), 4)
-                    fallback_results.append(schema)
-            fallback_results.sort(key=lambda item: float(item.get("final_score", 0.0)), reverse=True)
-            return _select_diverse_candidates(fallback_results, top_k=max(1, top_k))
+            raise RuntimeError(f"Tool_Search embedding retrieval failed: {e}") from e
 
 
 class QueryRewrite(BaseTool):
@@ -2185,7 +2146,8 @@ class QueryRewrite(BaseTool):
     description: str = (
         "Rewrite, expand, or decompose complex or ambiguous user queries. "
         "Converts colloquial questions to normalized queries suitable for retrieval, "
-        "or splits them into multiple sub-queries for multi-hop reasoning."
+        "or splits them into multiple sub-queries for multi-hop reasoning. "
+        "This is text preparation only: it does not search videos, captions or transcripts and does not discover event timestamps."
     )
     tags: list = ["base", "retrieval", "rewrite"]
     
@@ -2857,6 +2819,7 @@ class VideoSummary(BaseTool):
 
     def run(self, **kwargs) -> Dict[str, Any]:
         from core.llm.provider import get_llm_provider
+        from toolkit.model_results import generate_model_result
 
         video_hint = kwargs.get("video") or kwargs.get("video_path")
         resolved_scope = sorted(runtime_session.resolve_video_scope(video_hint))
@@ -2917,7 +2880,7 @@ class VideoSummary(BaseTool):
                 model_name=self.model_path,
                 model_role="subagent",
             )
-            raw_summary = provider.generate(
+            generation = generate_model_result(provider,
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
                 do_sample=False,
@@ -2927,7 +2890,7 @@ class VideoSummary(BaseTool):
                     1024,
                 ),
             )
-            summary_text = str(raw_summary or "").strip()
+            summary_text = generation["result"].strip()
         except Exception as exc:
             logger.warning("Video_Summary failed to generate model summary: %s", exc)
             return {
@@ -2953,6 +2916,9 @@ class VideoSummary(BaseTool):
                 "resolved_video_scope": resolved_scope,
                 "segment_count": len(segment_rows),
                 "summary": summary_text,
+                "raw_response": generation["raw_response"],
+                "reasoning": generation["reasoning"],
+                "reasoning_available": generation["reasoning_available"],
                 "source_segments": [
                     {
                         "segment_ref": row.get("segment_ref"),
@@ -2983,6 +2949,7 @@ class EvidenceVerify(BaseTool):
                 "type": "string",
                 "description": "The user's original question for the planner.",
             },
+            "options": {"type": ["object", "array", "null"], "description": "Answer options keyed by letter, or an ordered list; each is checked separately."},
             "question": {
                 "type": "string",
                 "description": "Alias for original_question.",
@@ -3045,6 +3012,8 @@ class EvidenceVerify(BaseTool):
         **kwargs,
     ) -> Dict[str, Any]:
         from core.llm.provider import get_llm_provider
+        from toolkit.model_results import generate_model_result
+        from toolkit.evidence_validation import validate_evidence, normalize_option_assessments, normalize_conflicts, observation_model_view, extract_answer_options
 
         question = str(
             original_question
@@ -3064,6 +3033,9 @@ class EvidenceVerify(BaseTool):
         evidence_items = _normalize_evidence_items(explicit_evidence)
         if not evidence_items:
             evidence_items = _extract_evidence_items(context_payload)
+        observations = runtime_session.get_tool_results()
+        evidence_items = validate_evidence(evidence_items, observations)
+        options = kwargs.get("options") or extract_answer_options(question)
 
         answer_text = str(
             answer_draft
@@ -3086,6 +3058,8 @@ class EvidenceVerify(BaseTool):
             evidence_items=evidence_items,
             answer_draft=answer_text,
             verification_prompt=verify_instruction,
+            options=options,
+            observations=observation_model_view(observations, evidence_items),
         )
         fallback = _fallback_evidence_verify_assessment(evidence_items=evidence_items)
 
@@ -3094,23 +3068,22 @@ class EvidenceVerify(BaseTool):
                 model_name=self.model_path,
                 model_role="subagent",
             )
-            raw_response = provider.generate(
+            generation = generate_model_result(provider,
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
                 do_sample=False,
-                enable_thinking=False,
-                max_tokens=min(
-                    int(getattr(settings, "subagent_max_generation_tokens", 2048) or 2048),
-                    1024,
-                ),
+                enable_thinking=settings.tool_reasoning_enabled,
+                respect_role_generation_config=False,
+                max_tokens=settings.tool_reasoning_max_new_tokens,
             )
+            raw_response = generation["raw_response"]
         except Exception as exc:
             logger.warning("evidence_verify failed to call verification model: %s", exc)
             return {
                 "status": "error",
                 "error": str(exc),
                 "chain_complete": fallback["chain_complete"],
-                "can_finish": fallback["can_finish"],
+                "can_finish": False,
                 "overconfident": fallback["overconfident"],
                 "has_logic_issue": fallback["has_logic_issue"],
                 "loop_risk": fallback["loop_risk"],
@@ -3121,13 +3094,15 @@ class EvidenceVerify(BaseTool):
             }
 
         raw_text = str(raw_response or "").strip()
-        parsed = _extract_first_json_payload(raw_text)
+        parsed = generation["parsed_json"]
 
         if not isinstance(parsed, dict):
             assessment = _fallback_evidence_verify_assessment(
                 evidence_items=evidence_items,
                 raw_model_text=raw_text,
             )
+            assessment["chain_complete"] = False
+            assessment["recommendation"] = "Do not finish: the verification model did not return a valid structured assessment."
             return enrich_tool_result(
                 {
                     "status": "success",
@@ -3135,7 +3110,9 @@ class EvidenceVerify(BaseTool):
                     "original_question": question,
                     "evidence_count": len(evidence_items),
                     "chain_complete": bool(assessment["chain_complete"]),
-                    "can_finish": bool(assessment["can_finish"]),
+                    "can_finish": False,
+                    "citation_checks": evidence_items,
+                    "option_assessments": normalize_option_assessments(options, [], observations),
                     "overconfident": bool(assessment["overconfident"]),
                     "has_logic_issue": bool(assessment["has_logic_issue"]),
                     "loop_risk": bool(assessment["loop_risk"]),
@@ -3144,6 +3121,9 @@ class EvidenceVerify(BaseTool):
                     "missing_evidence": assessment["missing_evidence"],
                     "recommendation": assessment["recommendation"],
                     "raw_assessment": raw_text,
+                    "raw_response": raw_text,
+                    "reasoning": generation["reasoning"],
+                    "reasoning_available": generation["reasoning_available"],
                     "result": assessment["recommendation"],
                 },
                 tool_name=self.name,
@@ -3170,6 +3150,9 @@ class EvidenceVerify(BaseTool):
         normalized = {
             "status": "success",
             "parse_status": "json",
+            "raw_response": raw_text,
+            "reasoning": generation["reasoning"],
+            "reasoning_available": generation["reasoning_available"],
             "original_question": question,
             "evidence_count": len(evidence_items),
             "chain_complete": _coerce_bool(parsed.get("chain_complete"), fallback["chain_complete"]),
@@ -3187,6 +3170,20 @@ class EvidenceVerify(BaseTool):
             "parsed_json": parsed,
             "result": recommendation or fallback["recommendation"],
         }
+        normalized["citation_checks"] = evidence_items
+        normalized["option_assessments"] = normalize_option_assessments(options, parsed.get("option_assessments"), observations)
+        normalized["conflicts"] = normalize_conflicts(parsed.get("conflicts"), observations)
+        unverified = [item for item in evidence_items if item["citation_status"] != "resolved"]
+        unresolved = any(not isinstance(item, dict) or not _coerce_bool(item.get("resolved")) for item in normalized["conflicts"])
+        draft_option = answer_text.strip().strip("(). ").upper()
+        supported = any(row["verdict"] == "supported" and row["option"].upper() == draft_option for row in normalized["option_assessments"])
+        incomplete = any(item.get("evidence_status") != "exact" for item in evidence_items)
+        if not evidence_items or unverified or incomplete or unresolved or (options and not supported):
+            normalized["can_finish"] = False
+            normalized["chain_complete"] = False
+            normalized["validation_note"] = "Runtime citation checks or option/conflict checks do not permit finishing; see structured fields."
+            normalized["recommendation"] = "Do not finish: " + normalized["validation_note"]
+            normalized["result"] = normalized["recommendation"]
         return enrich_tool_result(normalized, tool_name=self.name)
 
 

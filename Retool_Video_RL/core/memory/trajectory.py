@@ -92,6 +92,7 @@ class Trajectory:
     success: bool = False
     error_message: Optional[str] = None
     debug_events: List[Dict[str, Any]] = field(default_factory=list)
+    tool_execution_events: List[Dict[str, Any]] = field(default_factory=list)
     start_time: datetime = field(default_factory=_utc_now)
     end_time: Optional[datetime] = None
 
@@ -176,6 +177,7 @@ class Trajectory:
             "success": self.success,
             "error_message": self.error_message,
             "debug_events": self.debug_events,
+            "tool_execution_events": self.tool_execution_events,
             "start_time": _format_utc_timestamp(self.start_time),
             "end_time": _format_utc_timestamp(self.end_time),
             "started_at": _format_utc_timestamp(self.start_time),

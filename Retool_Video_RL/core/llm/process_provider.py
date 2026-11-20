@@ -180,12 +180,11 @@ def _run_transformers_worker(
                 if method == "generate":
                     with accelerator_queue_lock:
                         generate_started = time.perf_counter()
-                        result = provider.generate(
-                            request.get("messages") or [],
-                            temperature=request.get("temperature"),
-                            max_tokens=request.get("max_tokens"),
-                            **dict(request.get("kwargs") or {}),
-                        )
+                        from .inference_metrics import inference_scope
+                        with inference_scope(**dict(request.get("inference_metrics_context") or {})):
+                            result = provider.generate(
+                                request.get("messages") or [], temperature=request.get("temperature"),
+                                max_tokens=request.get("max_tokens"), **dict(request.get("kwargs") or {}))
                         logger.info(
                             "Process-backed worker completed generate role=%s request_id=%s duration=%.3fs",
                             str(provider_kwargs.get("model_role") or "default").strip() or "default",
@@ -329,6 +328,9 @@ class ProcessBackedLLMProvider(BaseLLM):
             pass
 
     def _request(self, method: str, **payload: Any) -> Any:
+        if method == "generate" and os.environ.get("TOOLSTAR_INFERENCE_METRICS") == "1":
+            from .inference_metrics import current_scope
+            payload["inference_metrics_context"] = current_scope()
         with self._lock:
             self._ensure_process_locked()
             request_id = str(uuid.uuid4())

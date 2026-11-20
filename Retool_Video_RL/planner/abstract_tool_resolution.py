@@ -134,88 +134,9 @@ def _score_candidate(
     abstract_tool: str,
     description: str,
 ) -> float:
-    target = _normalize_token(f"{abstract_tool} {description}")
-    normalized_abstract_tool = _normalize_token(abstract_tool)
-    cand_name = _normalize_token(candidate.get("name", ""))
-    raw_cand_name = str(candidate.get("name", "")).strip()
-    cand_desc = _normalize_token(candidate.get("description", ""))
-    score = float(candidate.get("final_score", candidate.get("score", 0.0)) or 0.0)
-    target_tokens = set(target.split())
-    route_family = str(candidate.get("route_family", "")).strip().lower()
-
-    if cand_name == _normalize_token(abstract_tool):
-        score += 10.0
-    if target_tokens.intersection({"search", "find", "locate", "retrieve", "segment", "timestamp"}):
-        if route_family == "evidence_retrieval":
-            score += 4.5
-        elif route_family == "registry_search":
-            score -= 0.5
-        elif route_family == "external_web":
-            score -= 4.5
-    if target_tokens.intersection({"rewrite", "normalize", "expand", "decompose"}):
-        if route_family == "query_rewrite":
-            score += 4.0
-    if target_tokens.intersection({"frame", "screen", "visual", "visible", "image", "text"}):
-        if route_family == "direct_evidence":
-            score += 4.0
-        elif route_family == "external_web":
-            score -= 5.0
-        if raw_cand_name in {"Inspect_Frame", "OCR_Extract"}:
-            score += 1.25
-    if normalized_abstract_tool in {"retrieve video frames", "retrieve video frame", "retrieve frames", "retrieve frame"}:
-        if raw_cand_name == "Inspect_Frame":
-            score += 5.0
-        elif raw_cand_name == "OCR_Extract" and not target_tokens.intersection({"text", "ocr", "label", "subtitle", "caption", "written"}):
-            score -= 3.0
-    if target_tokens.intersection({"observe", "progression", "motion", "moving", "action"}):
-        if raw_cand_name == "Inspect_Frame":
-            score += 1.75
-        elif raw_cand_name == "OCR_Extract":
-            score -= 1.25
-    if target_tokens.intersection({
-        "before", "after", "when", "while", "happened", "opened", "closed",
-        "washed", "cleaned", "tidied", "took", "grabbed", "watched",
-    }):
-        if raw_cand_name == "Action_Recognition":
-            score += 2.25
-        elif raw_cand_name == "OCR_Extract":
-            score -= 1.75
-        elif raw_cand_name == "Entity_Track":
-            score -= 0.85
-    if target_tokens.intersection({"ocr", "text", "label", "subtitle", "caption", "written"}):
-        if raw_cand_name == "OCR_Extract":
-            score += 2.0
-        elif raw_cand_name == "Action_Recognition":
-            score -= 1.0
-    if target_tokens.intersection({"track", "tracking", "trajectory", "appears", "visible"}):
-        if raw_cand_name == "Entity_Track":
-            score += 1.8
-    if target_tokens.intersection({
-        "clip", "video", "segment", "window", "overall", "holistic", "interaction",
-        "interactions", "order", "sequence", "scene", "state", "compare", "comparison",
-        "continuous", "navigation",
-    }):
-        if raw_cand_name == "Video_Clip_QA":
-            score += 3.2
-        elif raw_cand_name == "OCR_Extract":
-            score -= 1.25
-        elif raw_cand_name == "Entity_Track" and not target_tokens.intersection({"track", "tracking", "trajectory"}):
-            score -= 0.6
-    if target_tokens.intersection({"verify", "confirm", "consistency", "contradiction"}):
-        if route_family == "verification":
-            score += 4.0
-    if target_tokens.intersection({"calculate", "count", "sum", "total", "compare"}):
-        if route_family == "compute":
-            score += 3.5
-        elif raw_cand_name == "Video_Clip_QA":
-            score += 1.0
-
-    score += float(candidate.get("route_score", 0.0) or 0.0)
-    score += float(candidate.get("novelty_score", 0.0) or 0.0)
-
-    overlap = set(target.split()).intersection(set(f"{cand_name} {cand_desc}".split()))
-    score += 0.15 * len(overlap)
-    return score
+    # Exact-name dispatch and schema validation are handled separately.
+    # Keep the retriever's embedding order without a second semantic heuristic.
+    return float(candidate.get("score", candidate.get("final_score", 0.0)) or 0.0)
 
 
 def _normalize_field_aliases(fields: List[str]) -> List[str]:
@@ -355,8 +276,11 @@ def _adapt_semantic_retrieve_args(
 
 
 def _adapt_visual_probe_args(abstract_args: Dict[str, Any]) -> Dict[str, Any]:
+    from toolkit.time_utils import normalize_visual_time_args
+
+    abstract_args = normalize_visual_time_args(abstract_args)
     params: Dict[str, Any] = {}
-    for key in ("timestamp", "duration", "t_start", "t_end", "density", "query", "video", "video_path"):
+    for key in ("timestamp", "duration", "t_start", "t_end", "density", "query", "video", "video_path", "image_path"):
         value = abstract_args.get(key)
         if value not in (None, ""):
             params[key] = value

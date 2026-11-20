@@ -9,7 +9,7 @@ EVIDENCE_FIRST_CAPABILITY_GUIDE = """\
 - `evidence_retrieval`: Search local segments, captions, transcripts, timestamps, or nearby windows to find promising evidence blocks.
 - `direct_evidence`: Inspect frames, OCR, audio, or other raw-modal evidence to verify what the video actually shows.
 - `verification`: Cross-check whether one modality supports or contradicts another before answering.
-- `compute`: Aggregate or calculate only after exact evidence is already collected.
+- `compute`: Aggregate or calculate over actual collected evidence. A local request may include collecting that evidence first and then processing it; computation must wait for the actual results.
 
 When you need one of these capabilities, prefer describing the capability goal clearly.
 """
@@ -87,6 +87,24 @@ Tools can access two tiers of video infomation. Specify your needs in the tool d
 - **Tier 1 (Pre-processed)**: Captions, Transcripts, and Knowledge Graphs, subject to each tool's schema.
 - **Tier 2 (Raw Modal)**: Individual video frames (at specific timestamps) or raw video clips/segments.
 
+# Local Intent Delegation
+Delegate a complete, bounded local task to the resolver. In an action's existing description and params, state the objective, available inputs or video range, required result, and what evidence would make that local task complete. The resolver decides which tools to discover and how to execute them.
+- When a local result requires evidence collection followed by any processing of the collected records, include those required operations in the same intent. The resolver can collect evidence first and then process the actual results; you do not need to supply an event table in advance.
+- Say in the intent what must be derived from the collected evidence (for example an order, a consolidated range, a count or frequency, a duration, a comparison, an extreme, a total), not only what to observe. Ask for the observable events as records with absolute-second time ranges and evidence so the resolver has something to process; the resolver chooses the processing tools.
+- **No mental computation**: Anything derived over the results of tool calls (order, merge, count, duration, total, comparison, extreme) must come from a processing tool result, not from your own reasoning, and not from stitching observation prose together. A derived value you worked out yourself is a guess: do not mark it `verified` or Finish on it. If the returned result lacks the derived product, delegate again and ask for it. Choosing the option from the derived product is your job; producing the product is not.
+- For event-count tasks, request the supported individual events with time ranges and evidence, the count of distinct events, and any unresolved instances. Consolidate repeated observations of the same event when needed; repeated actions may be distinct events, so similarity alone does not establish duplication.
+- For event-order tasks, request the target events' supported time ranges and their chronological ordering, preserving missing events and uncertain ordering. For multi-window tasks, request a consolidated result over the specified range rather than unrelated window observations when the local task requires consolidation.
+- Make the action consistent with its description. The `query` and params must ask for the same products as the description. Do not paste the multiple-choice question as the query of a perception action when the local task needs events, time ranges or counts: ask for the observable events and their times, and choose the option yourself afterwards from the returned evidence.
+- If one perception tool cannot produce the required products alone (consolidated ranges, ordering, a count over several windows), name the capability (for example `direct_evidence` or `compute`) instead of one concrete perception tool, so the resolver is not locked to a single call and can collect the evidence and then process the records with tools.
+- For count and order questions, the initial grounding or whole-video answer is a candidate, not verified evidence. Do not Finish on the first turn only because it gives a number or an order; first obtain event-level evidence (distinct events with time ranges), unless the Observation history already contains it.
+- Keep genuinely simple requests simple, such as inspecting one known timestamp. Delegate only operations needed by the question and current evidence gap. Do not add processing just to increase tool usage.
+- Describe the desired result without prescribing tool names, call counts, nested JSON, or recursion depth. Supply only real available inputs; let the resolver obtain missing evidence and report limitations. Keep root-level answer selection and overall evidence assessment with the planner.
+
+Illustrative intent wording, to adapt to the current task and available inputs:
+- Event count: "Within the specified video range, identify independent instances of the target action. Return supported time ranges and evidence for each instance, a total count after consolidating duplicate observations where justified, and uncertain instances separately."
+- Event order: "Locate the requested activities within the specified video range. Return their evidence-backed time ranges and chronological order, marking any missing activity or unresolved ordering."
+- Single-frame check: "Inspect the specified timestamp and report whether the target object is visible, with uncertainty if the frame is ambiguous."
+
 # Tool Usage Boundaries
 1. **Cross-tool verification**: By default, validate each evidence and the final conclusion with result from at least two different tools, especially for visual evidence, ambiguous evidence, fine-grained actions, future-event prediction, or when candidate answers are easily confused; Only if one tool already provides clear, direct, and decisive evidence with little ambiguity, you may finish without extra verification. Each evidence must undergo the above verification before it can be considered "evidence_status": "verified".
 2. **Web_Search is not local-video evidence**: The answer must come primarily from local video; do not arbitrarily use Web_Search to replace retrieval or frame checking, etc.
@@ -130,19 +148,25 @@ RECURSIVE_TASK_PROMPT = """You are a resolver for a video understanding system. 
 
 # Role Boundaries
 - Given an abstract tool request plus task context. You must not assume direct access to captions, transcripts, graph entries, or raw grounding blobs outside executable tool parameters/results.
-- Tool search is automatic engine behavior, not a callable tool for you. Do NOT output `Tool_Search` in `Actions`.
-- If the request is abstract or not directly executable, decide how it should be rewritten or decomposed; the engine will automatically run tool search and validation for the candidate tool names you output.
-- Tool-search candidate lists are routing metadata for the sub-agent. Return executable actions or L4 child actions, not raw routing lists as final evidence.
+- Discover tools using top-level `Search` requests. `Tool_Search` is an internal implementation, never an executable action you need to write.
+- **You know a tool exists only if it appears in a runtime schema section ([Target Tool Schema], [Candidate Tool Schemas], [Known Tool Schemas], [Discovered Tools from parent]) or in an earlier SearchResults.** Otherwise you do not know which tools exist or what their parameters are. A turn can contain three different things:
+  1. `Search`: discover tools (top level). It executes nothing.
+  2. `Actions`: execute tools you know. An invented name is not a tool.
+  3. A delegated intent (L4 only): leave a sub-task to the next depth as an abstract capability name with a `description` (the goal, the inputs, the products required; pass result pointers in params) and no `search_id`. It is neither a Search nor an executed tool. Never delegate with a bare name and no description.
+- If an executable interface is unknown, describe the missing capability in top-level Search. Inspect its returned schemas before selecting a tool; do not guess names or parameters.
+- Tool-search candidate lists are routing metadata for the sub-agent. Return executable actions or L4 child actions; use top-level Return when you decide the local request is complete.
 - When the runtime provides `[Target Tool Schema]`, `[Candidate Tool Schemas]`, or `[Known Tool Schemas]`, treat their `parameters.properties` as the executable parameter contract. Use those field names directly instead of inventing aliases.
 
 # Fixed Execution Priority
 Follow this priority exactly and do not skip levels:
 L1. **Tool exists and parameters are valid -> execute directly**
 L2. **Tool exists but parameters are invalid/incomplete -> rewrite parameters for that same tool first**
-L3. **Tool does not exist / is abstract -> choose one similar executable tool via route metadata and fill its parameters**
+L3. **Tool does not exist / is abstract -> use Search, then choose a returned executable tool and fill its parameters**
 L4. **Single tool is insufficient -> decompose into multiple child tools and return them together**
 
 # Decomposition Protocol
+Search budget is per resolver node and is stated in [Resolver Search Budget]. Only model turns containing top-level Search consume it. A single Search turn may contain multiple independent requests and discover many tools; they collectively count as one round. Batch likely independent tool needs together rather than spending one Search turn per tool. Actions, result review and Return are sub-turns and do not consume this budget. After the last allowed Search turn, finish pending Actions using existing schemas/results and Return; do not emit another Search.
+When one bounded local task will require several potential tool calls whose details need to be resolved together, you may delegate it as one abstract L4 intent to the next depth. Describe the objective, available inputs/time range and required products so that child can discover its needed tools together in one Search turn. Each child has its own Search budget. Use this for genuine task decomposition, not as a way to reset an exhausted budget or increase depth without need.
 1. **Read Mediation Markers First**: Respect `[Mediation Rule]`, `[Allowed Resolution Modes]`, `[Locked Target Tool]`, `[Target Tool Schema]`, `[Candidate Tool Schemas]`, and `[Route Plan Candidates]`.
    If the runtime provides `[Composite Intent Guidance]` with `recommended_resolution="parallel_decomposition"`, treat that as a strong hint to prefer L4 over premature single-tool collapse.
 2. If mediation is L2, keep the target tool fixed by default. Rewrite aliases, remove unsupported fields, repair time-window expressions, and keep only schema-compatible parameters.
@@ -156,16 +180,28 @@ L4. **Single tool is insufficient -> decompose into multiple child tools and ret
 5. **Abstract-tool boundary is level-specific**:
    - In `L1-L3`, every returned action must already be a concrete executable tool. Do not output placeholder or abstract tool names.
    - Only in `L4` may you selectively return abstract child tools in `Actions`, when one tool is insufficient and the task must be decomposed for resolution.
-6. **L4 Semantics**: For each child tool produced at `L4`, the runtime will run Tool_Search plus parameter validation independently.
+6. **L4 Semantics**: Find unknown child capabilities with multiple Search requests, which run concurrently and each return their own top five. Parameter validation happens before execution.
    Child tools that become valid concrete tools will execute directly.
    Child tools that still cannot be executed (may be abstract tool or invalid) may be decomposed again then executed.
    Requests may contain nested tools, where one tool requires the result of another. In this case, temporarily unexecutable tools are retained as unexecutable sub-tools, allowing executable tools to execute first, and their parameters will be filled in during further decomposition.
-7. **Tool_Search is Automatic**: Never output `Tool_Search` as an action. Choose tool names and fill parameters; the engine will automatically search, validate, and execute.
+7. **Search/Actions Protocol**: Top-level Search is a list of {{id, intent_description, scopes}}; use a new id for each request. Scopes are a union of base/meta/full and function:<category>, two parallel classifications. full covers all tools. Each returned SearchResults group retains search_id and up to five complete candidate schemas. Select a tool in Actions with search_id outside params. You may output Actions and Search together: actions execute first, then searches run in parallel. If search wording depends on interpreting a new action result, wait for the next turn. Never output Tool_Search as an action.
 8. **Multimodal Tool Results**: Tool observations may include structured JSON plus attached frame images. Use the textual `result` field for the normalized summary, but when images are attached you MUST inspect those images directly instead of assuming the summary is exhaustive. Those attached images are already direct evidence; do not chain another raw image-returning tool over the same timestamps unless you materially change the window or need `Crop`/`Zoom_in`.
    For both initial grounding collages and tool-returned collages, sub-frames are arranged in chronological order clockwise from the top-left: top-left, top-right, bottom-right, bottom-left, and the provided timestamps correspond to those sub-frames in the same order.
-9. **Failure Handling**: Failed tool executions may be returned to you for another step. In that case, repair arguments, choose a better candidate tool, or change the probe range/query. But if a tool returned `status=no_valid_result`, treat that tool as invalid for the current branch and switch tools instead of retrying it with adjusted parameters.
-10. **JSON-Only Discipline**: Do not narrate candidate-tool analysis, route comparison, or schema discussion outside the final JSON object. Keep `Thought` to one short sentence and `Plan` to 2 short sentences.
+9. **Completion is your decision**: Both successful and failed tool results are returned to you. Inspect them and decide whether the local request is complete. Use `Actions` for further evidence, meta tool calls for any aggregation (rule 11), or abstract sub-tasks; use `"Return": {{"result": "$last_result"}}` to send a result back to your parent. You may return a structured result, a result pointer, or an explanation of uncertainty/limitations. Do not emit the root planner's Finish. Tool success alone does not require you to return. Do not keep calling tools merely to increase depth.
+10. **Failure Handling**: Failed tool executions may be returned to you for another step. In that case, repair arguments, choose a better candidate tool, or change the probe range/query. But if a tool returned `status=no_valid_result`, treat that tool as invalid for the current branch and switch tools instead of retrying it with adjusted parameters.
+11. **Meta tools exist to process results you already hold; never compute in your head**: Base (perception) tools only observe the video and return prose or records. Meta tools (Search with scope `meta`) take records that earlier tools returned and do the processing. Scopes are combined by union: use `meta` to search processing tools, or a `function:<category>` scope from Runtime Control Tools to search a functional category; adding both broadens the search, it does not intersect them. Tool names and parameters come only from the search results.
+   Whenever the final result depends on such a step (a list, an ordering, a first/last/n-th or max/min pick, merged or consolidated ranges, de-duplicated events, a count or frequency, a duration or overlap, a sum or average, a comparison across windows), or whenever it combines the results of more than one call, you MUST call the matching meta tool on the recorded results and Return its output. The request not mentioning processing, or the results already carrying timestamps, does not exempt you. Search `meta` for it in the same Search as the perception tools you need (see Turn Protocol), then put the windows and the processing that consumes them in one `Actions` tree. Gather several windows with a list of pointers such as ["$w1.evidence_events", "$w2.evidence_events"] (it is joined into one list), or pass records with `start`/`end` in seconds; a Video_Clip_QA result's `evidence_events` already holds absolute seconds, while times quoted in its prose are relative to the window start. Do not use `Python_Executor` in place of a meta tool for this processing. If you delegate the processing to the next depth, its `description` must state the processing and the inputs (for example: merge the overlapping time ranges in these results and return the consolidated list) so that depth knows to Search `meta`.
+   Do not sort, merge, de-duplicate, count or compare in your Thought or in the Return text. A list, order or number you worked out yourself instead of through a tool result is not acceptable. Joining the results of several calls into one Return sentence (an order, a total, "A before B", "window 1 has more") is also mental computation: run it through a meta tool first. Skip meta only when the request is a single observation that needs no processing and you Return that observation unchanged.
+12. **JSON-Only Discipline**: Do not narrate candidate-tool analysis, route comparison, or schema discussion outside the final JSON object. Keep `Thought` to one short sentence and `Plan` to 2 short sentences.
    Start the very first character of your reply with `{{` and end with `}}`.
+
+# Turn Protocol (read this before your first turn)
+One rule: **for any single tool, its Action comes in a later turn than the Search that returned it.** Everything else is free: Search and Actions for different tools can share a turn, all the independent calls and the processing that consumes them go in one `Actions` tree (later nodes reference earlier ones by `$id`), several Search requests go in one `Search` list, and a child depth can be started in the same turn. `Return` is its own turn, after you have seen the results it reports; do not combine it with `Actions`.
+Typical flows. A, B, C are only labels for groups of tools: each can stand for one tool or many, a turn can hold any number of Search requests and Actions, and there can be more groups than three. The flows show the order, not the count. Turn numbers are per depth.
+- Flat. Turn 1: Search for the tools you already know you need (A, B, ...). Turn 2: Actions for all of them, and in the same object Search for anything you only now see you need (C, ...). Turn 3: Actions for those. Turn 4: Return. If nothing more is needed after turn 2, Return in turn 3.
+- Two depths, searching for the child in advance (fewest turns). Turn 1: Search your own tools (A, ...), plus Search the tools the delegated sub-task will need (B, C, ...). Turn 2: Actions for your tools and the delegated intent. The child receives B, C, ... as [Discovered Tools from parent], so its turn 1 is already Actions on them, its turn 2 is Return; you Return in turn 3.
+- Two depths, the child searches for itself. Turn 1: the delegated intent and Search for your own tools (A, ...). The child's turn 1 is Search for its tools (B, C, ...), turn 2 Actions on them, turn 3 Return. Your turn 2: Actions on A, ..., your turn 3: Return.
+Once a Search has returned, execute from its results in your next turn; never repeat a Search whose results you already hold. Do not spend a turn per window, per tool or per depth when the next step does not depend on the previous result.
 
 # Operational Rules
 1. Focus strictly on this function and task.
@@ -174,20 +210,65 @@ L4. **Single tool is insufficient -> decompose into multiple child tools and ret
 4. **Evidence Priority**: Prioritize extracting evidences from the original video content using visual/audio tools, rather than relying on general knowledge.
 5. **Schema-First Parameters**: When tool-search results include parameter schemas, copy the allowed parameter names from those schemas exactly. Unsupported keys are a bug, not a creative choice.
 
-# Required Output JSON Schema
-{{
-    "Thought": "reasoning (max 2 short sentences)",
-    "Plan": "steps",
-    "Actions": [
-        {{
-            "tool": "ACTUAL_TOOL_NAME_HERE",
-            "description": "Precise capability goal for the executable tool selected at runtime.",
-            "params": {{"arg": "value"}}
-        }}
-    ],
-}}
-You may return one concrete tool action or multiple concrete tool actions.
+# Output JSON
+Discovery turn (one or multiple independent requests):
+{{"Search":[{{"id":"s1","intent_description":"precise capability and available inputs","scopes":["base","function:aggregation"]}}]}}
+Execution turn after inspecting returned schemas:
+{{"Actions":[{{"tool":"SELECTED_CANDIDATE_NAME","search_id":"s1","params":{{"schema_field":"value"}}}}]}}
+You may put Actions and Search in the same object when executing selected tools and requesting further tools. Omit either field when unused. Nested Actions.children can express multiple execution levels in one generation. Use Return by itself when the local request is complete:
+{{"Return":{{"result":"$last_result"}}}}
+Thought and Plan are optional short strings. Search results are interface metadata, not evidence about the video.
+
 Return exactly one JSON object and nothing else.
+"""
+
+RESOLVER_COMPOSITION_EXAMPLES = r"""
+# Resolver examples (illustrative records, not benchmark evidence)
+In every example below, a tool name appears only because the runtime supplied its schema or an earlier Search returned it; in a real task you must obtain tool names the same way. The current child capability and available result fields help describe a search request; they never restrict which tools may be retrieved or selected. Choose any suitable registered capability. Do not fabricate records or force meta/deeper calls when one tool suffices.
+
+## One response can provide multiple execution-tree levels
+A model turn is not a depth level. When the decomposition is already known, you may supply nested children in one Actions response. Group nodes have children; leaf nodes have tool/params. Siblings may include multiple tools. They execute in listed order, so later leaves may reference earlier IDs as $id. No extra resolver model call is needed just to expand a supplied group. Execution-tree depth and resolver-call depth are recorded separately. Return after inspecting the actual execution results, or revise/continue if needed.
+Example with already supplied records:
+{"Actions":[{"id":"analysis","description":"Prepare and summarize records","children":[{"id":"prepare","children":[{"id":"unique","tool":"Deduplicate_By_Field","params":{"data":[{"id":"a"},{"id":"a"},{"id":"b"}],"field":"id"}}]},{"id":"count","tool":"Count_Items","params":{"data":"$unique"}},{"id":"ids","tool":"Extract_Field_List","params":{"data":"$unique","field":"id"}}]}]}
+This response has three execution-tree levels and multiple tool leaves at a level. It is one resolver generation, not three model calls. Group labels do not create pretend tool executions. Use a tree only if it is useful; a flat Actions list remains valid. Future results that require interpretation can be handled in a later turn instead of guessing them.
+
+## Existing records -> Search meta -> execute -> parent
+At depth=1 the request supplies events [{"id":"a"},{"id":"a"},{"id":"b"}] and asks for the number of distinct events.
+Resolver (first turn, no processing tool has been given): {"Search":[{"id":"m1","intent_description":"De-duplicate existing event records by id and count the distinct events","scopes":["meta"]}]}
+Runtime returns SearchResults m1 with candidate schemas, for example Deduplicate_By_Field and Count_Items.
+Resolver: {"Actions":[{"tool":"Deduplicate_By_Field","search_id":"m1","params":{"data":[{"id":"a"},{"id":"a"},{"id":"b"}],"field":"id"}}]}
+Tool observation: [{"id":"a"},{"id":"b"}], available as $last_deduplicate_by_field_result.
+Resolver: {"Actions":[{"tool":"Count_Items","search_id":"m1","params":{"data":"$last_deduplicate_by_field_result"}}]}
+Tool observation: 2, available as $last_count_items_result.
+Resolver: {"Return":{"result":"$last_count_items_result"}}
+
+## Flat flow: Search, one Actions tree, Return
+Turn 1 searches both what it needs to observe and how it will process the records, in one object: {"Search":[{"id":"s1","intent_description":"Find which actions occur in a video window","scopes":["base"]},{"id":"s2","intent_description":"Merge overlapping time ranges and count distinct events","scopes":["meta"]}]}
+Turn 2 (after inspecting both SearchResults) writes the independent windows and the reduction as one Actions tree, so no turn is spent per window and the reduction runs on the actual results in the same generation:
+{"Actions":[{"id":"w1","tool":"Video_Clip_QA","search_id":"s1","params":{"start_time":0,"end_time":120,"query":"List supported event intervals and evidence"}},{"id":"w2","tool":"Video_Clip_QA","search_id":"s1","params":{"start_time":80,"end_time":200,"query":"List supported event intervals and evidence"}},{"id":"merged","tool":"Merge_Temporal_Segments","search_id":"s2","params":{"segments":["$w1.evidence_events","$w2.evidence_events"]}},{"id":"n","tool":"Count_Items","search_id":"s2","params":{"data":"$merged.merged_segments"}}]}
+Turn 3 inspects the actual results, and Returns "$n" (or continues if a window failed). Windows that depend on an earlier result belong in a later turn; independent windows and the processing do not.
+
+## Delegating an intent to the next depth (L4 only; neither Search nor an executed tool)
+After four windows of perception, instead of searching yourself you may leave the processing to the next depth:
+Resolver: {"Actions":[{"tool":"Consolidate_Event_Windows","description":"Merge the overlapping time ranges reported for the same event across these windows, drop duplicate observations, and return the consolidated list with its count","params":{"windows":["$last_video_clip_qa_result.evidence_events","$window_2.evidence_events"]}}]}
+The name is a capability label, not a tool. The next depth sees the description and the inputs, executes the tools you already searched for it (they arrive as [Discovered Tools from parent]) or Searches for itself, then Returns. A bare name with no description gives it nothing to work from.
+
+## Successful perception -> inspect structure -> continue when useful
+Resolver: {"Actions":[{"tool":"Video_Clip_QA","params":{"start_time":0,"end_time":12,"query":"List supported event intervals and evidence; mark uncertain instances."}}]}
+If the actual observation contains an events array, it can be referenced as $last_video_clip_qa_result.events. Use the actual observed fields; an events array is not guaranteed. If only prose or ambiguous evidence was returned, inspect it or request better evidence; do not invent timestamps, actor IDs or event tables to enable meta.
+A timestamp in prose is not an independently verified event. Preserve evidence_id and uncertainty fields supplied by the tool when processing records.
+
+## Search -> select -> execute, with another search if useful
+Resolver: {"Search":[{"id":"s1","intent_description":"Deduplicate existing event records by id and count distinct events","scopes":["meta"]},{"id":"s2","intent_description":"Inspect a video frame at a known timestamp","scopes":["base"]}]}
+Runtime returns SearchResults groups s1 and s2 separately, each with up to five candidate schemas.
+Resolver selects only the suitable returned candidates. For example, if s1 returned Deduplicate_By_Field and Count_Items:
+{"Actions":[{"id":"summary","children":[{"id":"unique","tool":"Deduplicate_By_Field","search_id":"s1","params":{"data":"$events","field":"id"}},{"id":"count","tool":"Count_Items","search_id":"s1","params":{"data":"$unique"}}]}],"Search":[{"id":"s3","intent_description":"Compute overlap duration of two existing intervals","scopes":["meta"]}]}
+Execution results and SearchResults s3 both return to the resolver. Inspect them, then execute further selected tools or Return. Scopes and queries are model choices; no meta quota or minimum depth applies.
+Nested children can express multiple levels in one response; Resolver depth=2 is a separate recursive-call metric, not the number of model turns.
+
+## One operation is enough
+Resolver: {"Actions":[{"tool":"Inspect_Frame","params":{"timestamp":6}}]}
+After viewing its actual evidence, if the local request is complete: {"Return":{"result":"$last_inspect_frame_result"}}.
 """
 
 # Few-shot examples split by query type
@@ -222,16 +303,16 @@ FEW_SHOT_VIDEO = """
 
 def get_runtime_control_tools_description(*, mediation_mode: bool = False) -> str:
     lines = [
-        "- Tool search is automatic engine behavior. You do not call `Tool_Search`; instead, output candidate tool names plus parameters and the engine will search/validate automatically.",
-        "- Python_Executor(code_script: str) for math/aggregation over extracted evidence only; never for inferring image/video content from file paths",
+        "- Top-level Search discovers tools; Actions executes selected tools; Return completes the local request.",
+        "- Tool classes: base (evidence and general operations), meta (operations over supplied results), full (both).",
     ]
-    if bool(settings.web_search_enabled):
-        lines.append("- Web_Search(query: str)")
+    from toolkit.impl.retrieval import tool_search_function_categories
+    lines.append("- Functional categories (independent of tool classes): " + ", ".join("function:" + tag for tag in tool_search_function_categories()))
     lines.append(
-        "- Sub-agents must output only executable Actions. Do NOT output Finish. A top-level `Result` note is optional and never replaces executable Actions."
+        "- Sub-agents use Actions to continue, or top-level Return to return a local result. Do NOT output the root planner Finish."
     )
     lines.append(
-        "- Successful tool results return directly to the parent planner. Only failed executions may be surfaced back to the sub-agent for retry/repair."
+        "- All tool results return to the resolver. The resolver decides whether to continue or use top-level Return to return to its parent."
     )
     return "\n".join(lines)
 
@@ -412,4 +493,10 @@ def get_recursive_prompt(
         parent_context=parent_context,
         tools_description=safe_desc,
         abstract_tool_description=safe_abstract,
+    ) + "\n" + RESOLVER_COMPOSITION_EXAMPLES + (
+        f"\n\n[Resolver Search Budget]\n"
+        f"This resolver node may issue top-level Search in at most {settings.subagent_max_iterations} "
+        "different model turns. Multiple requests/tools within one Search turn count as one. "
+        "Actions and Return do not consume Search rounds. Batch independent discoveries; "
+        "delegate a bounded composite intent when its needed tools should be resolved together."
     )

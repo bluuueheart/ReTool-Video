@@ -2,6 +2,7 @@
 import logging
 import importlib
 import inspect
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Type
 
@@ -107,6 +108,14 @@ class ToolRegistry:
         self._missing_tool_warnings.discard(instance.name)
         logger.debug(f"Registered tool class: {instance.name}")
     
+    def resolve_name(self, name: str) -> str:
+        """Resolve case/separator variants only; leave abstract capability names intact."""
+        if name in self._tools:
+            return name
+        key = re.sub(r"[\s_-]+", "", str(name)).casefold()
+        matches = [n for n in self._tools if re.sub(r"[\s_-]+", "", n).casefold() == key]
+        return matches[0] if len(matches) == 1 else name
+
     def get_tool(self, name: str, *, log_missing: bool = True) -> BaseTool:
         """Get tool by name with smart dispatch logic.
         
@@ -120,6 +129,7 @@ class ToolRegistry:
         Returns:
             Tool instance or PlaceholderTool
         """
+        name = self.resolve_name(name)
         if not self._is_tool_enabled(name):
             if log_missing and name not in self._missing_tool_warnings:
                 logger.info(f"Tool '{name}' is disabled by runtime settings. Returning PlaceholderTool.")
@@ -143,6 +153,7 @@ class ToolRegistry:
         Returns:
             True if real tool exists
         """
+        name = self.resolve_name(name)
         return (
             self._is_tool_enabled(name)
             and name in self._tools
@@ -192,7 +203,18 @@ class ToolRegistry:
     
     def get_tool_schemas(self, tags: Optional[List[str]] = None) -> List[Dict]:
         """Get schemas for tools (for LLM context), optionally filtered by tags."""
-        return [tool.get_schema() for tool in self.get_all_tools(tags=tags)]
+        return [tool.get_schema() for tool in self.get_searchable_tools(tags=tags)]
+
+    def get_searchable_tools(self, tags: Optional[List[str]] = None) -> List[BaseTool]:
+        """One entry per merged capability, without removing legacy dispatch."""
+        from toolkit.tool_aliases import MERGED_TOOL_NAMES
+
+        tools = self.get_all_tools(tags=tags)
+        enabled = {tool.name for tool in self.get_all_tools()}
+        return [tool for tool in tools if not (
+            tool.name in MERGED_TOOL_NAMES
+            and all(name in enabled for name in MERGED_TOOL_NAMES[tool.name])
+        )]
     
     def auto_discover(self, impl_dir: Optional[Path] = None):
         """Auto-discover and load tools from impl directory.
@@ -243,7 +265,7 @@ class ToolRegistry:
         Returns:
             Formatted string with tool descriptions
         """
-        tools = self.get_all_tools(tags=tags)
+        tools = self.get_searchable_tools(tags=tags)
         if not tools:
             return "No tools available."
         

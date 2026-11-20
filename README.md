@@ -1,333 +1,105 @@
 # ReTool-Video
 
-ReTool-Video is an agent framework for video understanding and tool use. The current open-source version mainly organizes and preserves the directly runnable Mix evaluation pipeline, which is used to evaluate a model's video tool-use capability on `MVBench`, `MLVU`, and `Video-MME`.
+ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release contains the inference pipeline and the Mix evaluator used for the rebuttal-stage evaluation on MVBench, MLVU, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
 
-## Repository Structure
+## Quickstart
 
-```text
-ReTool-Video/
-├─ README.md
-├─ environment.yml
-├─ docs/
-│  ├─ README.md
-│  ├─ SETUP.md
-│  ├─ PRD.md
-│  ├─ Implementation.md
-│  ├─ TODO.md
-│  ├─ RL_solution.md
-│  └─ conclusion.md
-├─ evaluationVideo/
-│  └─ Mix/
-│     ├─ run_mix_batch.py
-│     ├─ run_mix_batch.sh
-│     ├─ mix_config.json
-│     ├─ mix_datasets.py
-│     ├─ mix_state.py
-│     ├─ reward_metrics.py
-│     └─ *_query_prompt.txt
-└─ Retool_Video_RL/
-   ├─ run_e2e.py
-   ├─ config/
-   ├─ planner/
-   ├─ preprocessing/
-   ├─ runtime/
-   ├─ toolkit/
-   └─ core/
-```
-
-## Environment Setup
+From the repository root on Linux with a CUDA-capable GPU, create the inference environment and set a local model directory. The environment includes FFmpeg and the Transformers backend.
 
 ```bash
 conda env create -f environment.yml
 conda activate retoolv
+export MODEL_BASE_PATH="$PWD/models"
+
+hf download Qwen/Qwen3.5-9B --local-dir "$MODEL_BASE_PATH/Qwen/Qwen3.5-9B"
+hf download Qwen/Qwen3-VL-Embedding-2B --local-dir "$MODEL_BASE_PATH/Qwen/Qwen3-VL-Embedding-2B"
+hf download Qwen/Qwen3-Embedding-0.6B --local-dir "$MODEL_BASE_PATH/Qwen/Qwen3-Embedding-0.6B"
+hf download Systran/faster-whisper-large-v3 --local-dir "$MODEL_BASE_PATH/Systran/faster-whisper-large-v3"
+
+python Retool_Video_RL/run_e2e.py /path/to/video.mp4 \
+  "What happens in this video?" ./local_runs/single_video \
+  --runtime-profile evaluation_local
 ```
 
-## Models and Configuration
+Use `hf auth login` for gated checkpoints and datasets. If your CTranslate2 installation cannot use the available CUDA libraries, set `PREPROCESS_ASR_DEVICE=cpu` to run Whisper on the CPU. Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
 
-The configuration is in [Retool_Video_RL/config/settings.py](Retool_Video_RL/config/settings.py).
+### Optional vLLM backend
 
-Before running, you need to confirm at least the following:
+The rebuttal-stage runs used vLLM for the planner, resolver, captioning, and visual QA. Install upstream vLLM in a separate Python environment because its Transformers requirements may differ from the inference client's. Follow [vLLM's GPU installation guide](https://docs.vllm.ai/en/v0.19.0/getting_started/installation/gpu/) and the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B).
 
-1. `model_base_path`
-   The current default value is `/mnt/data/models`. If your model directory is different, change it to the actual local path on your machine.
-2. Model subpaths
-   For example, `planner_model_subpath`, `subagent_model_subpath`, and `qwen3_vl_embedding_model_subpath`. By default, they point to local Qwen-series models.
-3. `.env` or environment variables
-   `Settings` supports reading configuration from `.env`. If you use an OpenAI-compatible service, you can also provide variables such as `API_KEY`, `API_BASE`, and `MODEL`.
-
-If you are simply following the current default evaluation pipeline, the top priority is to make sure the local model paths are correct.
-
-## Dataset and Model Download Guide
-
-The default Mix configuration file is [evaluationVideo/Mix/mix_config.json](evaluationVideo/Mix/mix_config.json). Before running, you need to prepare the datasets and local models first, and then modify the paths in this configuration file according to your machine's directory layout.
-
-### 0. Install the Hugging Face CLI First
-
-`hf download` is the recommended download method from the official Hugging Face CLI. See the official documentation for command details:
-<https://huggingface.co/docs/huggingface_hub/package_reference/cli>
+Set `TOOLSTAR_VLLM_BIN` to the directory containing the installed `vllm` executable. Set `TOOLSTAR_VLLM_MEDIA_ROOT` to the smallest shared directory containing both the input videos and the generated clips and frames. For the example below, place the datasets and evaluation workspace under the repository root.
 
 ```bash
-python -m pip install -U "huggingface_hub[cli]"
-hf auth login
+export TOOLSTAR_VLLM_BIN=/path/to/vllm-env/bin
+export TOOLSTAR_VLLM_MEDIA_ROOT="$PWD"
+export CUDA_VISIBLE_DEVICES=0
+export TOOLSTAR_VLLM_REQUEST_SEED=20261110
+
+bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
+  --vllm --max-samples 3
 ```
 
-Some datasets or models require you to accept the license or request access on the Hugging Face page first, especially:
+The launcher starts local replicas on the visible GPUs that have enough free memory. To use an existing vLLM server, pass `--vllm-urls http://127.0.0.1:8000/v1`, set `TOOLSTAR_VLLM_MODEL` to the server's served model name, and configure its `--allowed-local-media-path` to match the shared media directory. The auto-launched replicas bind to loopback.
 
-- `OpenGVLab/MVBench`
-- `MLVU/MVLU`
-- `pyannote/speaker-diarization-community-1`
+## Mix evaluation
 
-### 1. Dataset Download Commands
-
-The following commands are written based on the default directory structure of the current repository.
+### Prepare the datasets
 
 ```bash
-export DATA_ROOT=/path/to/datasets
-mkdir -p "$DATA_ROOT"
-```
-
-#### 1.1 MVBench
-
-```bash
-hf download OpenGVLab/MVBench \
-  --repo-type dataset \
-  --local-dir "$DATA_ROOT/MVBench"
-```
-
-References:
-
-- Paper: <https://arxiv.org/abs/2311.17005>
-- Hugging Face: <https://huggingface.co/datasets/OpenGVLab/MVBench>
-
-#### 1.2 MLVU
-
-```bash
-hf download MLVU/MVLU \
-  --repo-type dataset \
-  --local-dir "$DATA_ROOT/MLVU"
-```
-
-References:
-
-- Paper: <https://arxiv.org/abs/2406.04264>
-- Official repository: <https://github.com/JUNJIE99/MLVU>
-- Hugging Face Dev Set: <https://huggingface.co/datasets/MLVU/MVLU>
-
-#### 1.3 Video-MME
-
-```bash
-hf download VLM2Vec/Video-MME \
-  --repo-type dataset \
-  --local-dir "$DATA_ROOT/Video-MME" \
-  --include "videomme/*" \
-  --include "videos_chunked_*.zip"
+export DATA_ROOT="$PWD/datasets"
+hf download OpenGVLab/MVBench --repo-type dataset --local-dir "$DATA_ROOT/MVBench"
+hf download MLVU/MVLU --repo-type dataset --local-dir "$DATA_ROOT/MLVU"
+hf download VLM2Vec/Video-MME --repo-type dataset --local-dir "$DATA_ROOT/Video-MME" \
+  --include "videomme/*" --include "videos_chunked_*.zip"
 
 mkdir -p "$DATA_ROOT/Video-MME/videos"
-for f in "$DATA_ROOT"/Video-MME/videos_chunked_*.zip; do
-  unzip -q "$f" -d "$DATA_ROOT/Video-MME/videos"
+for archive in "$DATA_ROOT"/Video-MME/videos_chunked_*.zip; do
+  unzip -q "$archive" -d "$DATA_ROOT/Video-MME/videos"
 done
 ```
 
-References:
+Extract any MVBench or MLVU video archives so the dataset paths point to playable files. Set the dataset paths in [mix_config.json](evaluationVideo/Mix/mix_config.json). Dataset roots and the MVBench annotation path are relative to the directory containing the configuration file. MLVU and Video-MME annotation and video paths are relative to their dataset roots.
 
-- Official repository: <https://github.com/MME-Benchmarks/Video-MME>
-- Version including compressed video files: <https://huggingface.co/datasets/VLM2Vec/Video-MME>
+| Dataset | Set these paths |
+| --- | --- |
+| [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench) | `dataset_root` to the video directory and `json_root` to the task annotations. |
+| [MLVU Dev](https://huggingface.co/datasets/MLVU/MVLU) | `dataset_root` to the directory containing the annotations and videos. Set `annotation_root` and `video_root` to their actual locations. |
+| [Video-MME](https://huggingface.co/datasets/VLM2Vec/Video-MME) | `dataset_root` to the download directory. Check `annotation_path`, `video_id_mapping_path`, and `video_search_roots`. |
 
-### 2. Model Download Commands
+Keep model checkpoints under `MODEL_BASE_PATH` in their Hugging Face repository layout. Additional tools load their checkpoints on demand. See [settings.py](Retool_Video_RL/config/settings.py) for the paths used by audio QA, entity detection and tracking, emotion recognition, and image transforms. For speaker diarization, download `pyannote/speaker-diarization-community-1` and install `pyannote.audio`. To use a separate environment for diarization, set `DIARIZATION_PYTHON` to its Python executable.
 
-First, set the local model root directory. This directory needs to match the `model_base_path` in [Retool_Video_RL/config/settings.py](Retool_Video_RL/config/settings.py).
-
-```bash
-export MODEL_ROOT=/path/to/models
-mkdir -p "$MODEL_ROOT"
-```
-
-#### 2.1 Minimum Recommended Downloads for the Current Mix Evaluation
-
-These are the most essential models in the current uploaded Mix evaluation version and the ones most likely to be triggered in practice:
-
-```bash
-hf download Qwen/Qwen3.5-9B \
-  --local-dir "$MODEL_ROOT/Qwen/Qwen3.5-9B"
-
-hf download Qwen/Qwen3-VL-Embedding-2B \
-  --local-dir "$MODEL_ROOT/Qwen/Qwen3-VL-Embedding-2B"
-
-hf download Qwen/Qwen3-Embedding-0.6B \
-  --local-dir "$MODEL_ROOT/Qwen/Qwen3-Embedding-0.6B"
-
-hf download Systran/faster-whisper-large-v3 \
-  --local-dir "$MODEL_ROOT/Systran/faster-whisper-large-v3"
-```
-
-These correspond to:
-
-- `Qwen/Qwen3.5-9B`
-  - Default local model for planner / subagent / preprocess / `Video_Clip_QA`
-- `Qwen/Qwen3-VL-Embedding-2B`
-  - Embedding model for preprocessing vector retrieval
-- `Qwen/Qwen3-Embedding-0.6B`
-  - `Tool_Search` embedding
-- `Systran/faster-whisper-large-v3`
-  - ASR
-
-#### 2.2 Recommended Additional Downloads for Full Tool Coverage
-
-If you want to avoid discovering missing models only after a certain tool is triggered during evaluation, it is recommended to download the following as well:
-
-```bash
-hf download Qwen/Qwen3.5-0.8B \
-  --local-dir "$MODEL_ROOT/Qwen/Qwen3.5-0.8B"
-
-hf download Qwen/Qwen2.5-Coder-7B-Instruct \
-  --local-dir "$MODEL_ROOT/Qwen/Qwen2.5-Coder-7B-Instruct"
-
-hf download IDEA-Research/grounding-dino-base \
-  --local-dir "$MODEL_ROOT/IDEA-Research/grounding-dino-base"
-
-hf download laion/clap-htsat-fused \
-  --local-dir "$MODEL_ROOT/laion/clap-htsat-fused"
-
-hf download pyannote/speaker-diarization-community-1 \
-  --local-dir "$MODEL_ROOT/pyannote/speaker-diarization-community-1"
-
-hf download speechbrain/emotion-recognition-wav2vec2-IEMOCAP \
-  --local-dir "$MODEL_ROOT/speechbrain/emotion-recognition-wav2vec2-IEMOCAP"
-
-hf download Xenova/facial_emotions_image_detection \
-  --local-dir "$MODEL_ROOT/Xenova/facial_emotions_image_detection"
-
-hf download briaai/RMBG-2.0 \
-  --local-dir "$MODEL_ROOT/briaai/RMBG-2.0"
-
-hf download iic/cv_rrdb_image-super-resolution \
-  --local-dir "$MODEL_ROOT/iic/cv_rrdb_image-super-resolution"
-```
-
-These cover:
-
-- `Qwen/Qwen3.5-0.8B`
-  - `Query_Rewrite`, `Fold_Memory`
-- `Qwen/Qwen2.5-Coder-7B-Instruct`
-  - Code assistance path for `Python_Executor`
-- `IDEA-Research/grounding-dino-base`
-  - `Entity_Track`
-- `laion/clap-htsat-fused`
-  - `Audio_Event_Detect`
-- `pyannote/speaker-diarization-community-1`
-  - `Speaker_Diarization`
-- `speechbrain/emotion-recognition-wav2vec2-IEMOCAP`
-  - Audio emotion recognition
-- `Xenova/facial_emotions_image_detection`
-  - Image emotion recognition
-- `briaai/RMBG-2.0`
-  - `Crop`
-- `iic/cv_rrdb_image-super-resolution`
-  - `Zoom_in`
-
-### 3. Path Check After Downloading
-
-Before actual use, you usually need to check both of the following:
-
-- The dataset paths in `evaluationVideo/Mix/mix_config.json`
-- The `model_base_path` in [Retool_Video_RL/config/settings.py](Retool_Video_RL/config/settings.py)
-
-A typical dataset directory layout looks like this:
-
-```text
-datasets/
-├─ MVBench/
-│  ├─ video/
-│  └─ json/
-├─ MLVU/
-│  └─ MLVU/
-│     ├─ json/            # or upload_json/
-│     └─ video/
-└─ Video-MME/
-   ├─ videomme/
-   │  └─ test-00000-of-00001.parquet
-   ├─ videos/
-   └─ data/
-```
-
-## Start Evaluation
-
-### 1. Run the Full Mix Evaluation
-
-Linux / macOS:
+### Run all enabled datasets
 
 ```bash
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json
 ```
 
-Common arguments:
+Append `--vllm` to use the configured vLLM backend. Use `--max-samples` for a quick check or `--parallel-samples` to limit concurrency. Progress and results accumulate across runs that share the same output paths. For an independent run, use a separate configuration with a fresh `workspaces_root`, `progress_path`, `results_path`, and `videomme_official_output_path`.
+
+### Run a stratified sample
+
+The sampler allocates questions by subset size within each dataset, selects samples whose videos are available, and balances Video-MME durations within those allocations.
 
 ```bash
-python evaluationVideo/Mix/run_mix_batch.py \
+python evaluationVideo/Mix/make_stratified_sample.py \
   --config evaluationVideo/Mix/mix_config.json \
-  --max-samples 10 \
-  --parallel-samples 2 \
-  --skip-true
+  --counts mvbench=33,mlvu=33,videomme=34 \
+  --out-dir ./local_runs/stratified
+
+bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
+  --sample-uids @./local_runs/stratified/uids.txt
 ```
 
-Argument descriptions:
+### Read accuracy by dataset and subset
 
-- `--max-samples`: Only run the next N pending samples
-- `--parallel-samples`: Number of parallel samples; by default automatically inferred from visible CUDA devices
-- `--no-cache`: Disable preprocessing cache reuse
-- `--skip-true`: Import existing correct results into the progress file first to avoid rerunning them
+The evaluator writes `Mix_result.json` by default. `summary_by_dataset` reports overall accuracy for each dataset. `subset_summaries_by_dataset` reports `count`, `correct`, and `acc` by MVBench task group, MLVU task type, and Video-MME subcategory. Accuracy is a fraction between 0 and 1, and only subsets represented in the accumulated results appear.
 
-### 2. Debug a Single Sample
-
-You can directly call [Retool_Video_RL/run_e2e.py](Retool_Video_RL/run_e2e.py):
+The Video-MME `official_breakdown` under `summary_by_dataset.videomme` also reports accuracy by duration, domain, subcategory, and task type. Its denominator counts responses from which an option can be extracted. The evaluator separately writes `VideoMME_official_output.json` in the benchmark's output format.
 
 ```bash
-python Retool_Video_RL/run_e2e.py \
-  /path/to/video.mp4 \
-  "Answer the question about this video." \
-  ./debug_workspace \
-  --runtime-profile evaluation_local
+jq '.subset_summaries_by_dataset' evaluationVideo/Mix/Mix_result.json
 ```
-
-Common optional arguments:
-
-- `--no-cache`
-- `--log-path`
-- `--no-file-log`
-- `--flat-workspace`
-- `--shared-preprocess-root`
-- `--runtime-profile evaluation_local`
-
-Among them, `evaluation_local` forces the use of the local evaluation runtime configuration defined in the current codebase, which is suitable for offline evaluation scenarios.
-
-## Runtime Outputs
-
-After the Mix evaluation finishes, the following files are generated by default:
-
-- `evaluationVideo/Mix/Mix_result.json`
-  The aggregated final results, including `summary_by_dataset`, `subset_summaries_by_dataset`, and per-sample results.
-- `evaluationVideo/Mix/VideoMME_official_output.json`
-  Output for compatibility with the official `Video-MME` format.
-- `evaluationVideo/Mix/workspaces/mix_progress.json`
-  Progress file for resuming from checkpoints.
-- `evaluationVideo/Mix/workspaces/.../mix_sample_result.json`
-  Result file for each individual sample.
-- `evaluationVideo/Mix/workspaces/.../launcher.log`
-  Launch log for each individual sample.
-
-By default, the repository ignores most runtime artifacts, for example:
-
-- `evaluationVideo/**/workspaces*/`
-- `evaluationVideo/**/_shared_cache/`
-- `Retool_Video_RL/videorag_cache/`
-- `*.log`
-
-## Notes
-
-- The current README corresponds to the **w/o RL** evaluation version. The `Tool-use` metrics already reported in the current paper are `74.6 / 65.3 / 73.3`. Related scripts and documentation, including RL training, will continue to be added and uploaded later.
 
 ## Acknowledgement
 
-This project benefited from the following open-source project during implementation and organization, and we sincerely appreciate its support:
-
-- `verl`: <https://github.com/volcengine/verl>
+The vLLM provider and related inference paths build on [VAS](https://github.com/bluuueheart/VAS). We thank the maintainers of [vLLM](https://github.com/vllm-project/vllm), [Transformers](https://github.com/huggingface/transformers), [verl](https://github.com/volcengine/verl), and the [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench), [MLVU](https://github.com/JUNJIE99/MLVU), and [Video-MME](https://github.com/MME-Benchmarks/Video-MME) benchmarks.

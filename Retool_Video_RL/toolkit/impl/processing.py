@@ -111,29 +111,19 @@ class Aggregation(BaseTool):
             Aggregation result
         """
         if operation == "count":
-            result = len(data)
+            result = CountItems().run(data=data)
         
         elif operation == "sort" and target_field:
-            try:
-                result = sorted(data, key=lambda x: x.get(target_field, 0), reverse=True)
-            except:
-                result = data
+            result = SortItems().run(data=data, target_field=target_field, order="desc")
         
         elif operation == "max" and target_field:
-            try:
-                result = max(data, key=lambda x: x.get(target_field, 0))
-            except:
-                result = None
+            result = MaxItem().run(data=data, target_field=target_field)
         
         elif operation == "min" and target_field:
-            try:
-                result = min(data, key=lambda x: x.get(target_field, 0))
-            except:
-                result = None
+            result = MinItem().run(data=data, target_field=target_field)
         
         elif operation == "merge_temporal":
-            # Simple temporal merge for demo
-            result = {"merged_segments": data}
+            result = MergeTemporalSegments().run(segments=data)
         
         else:
             result = data
@@ -160,6 +150,8 @@ class CountItems(BaseTool):
     }
     
     def run(self, data: List[Any], **kwargs) -> int:
+        if not isinstance(data, list):
+            raise ValueError("Count_Items requires an array of items, not a string or object.")
         result = len(data)
         logger.info(f"Count_Items: counted {result} items")
         return result
@@ -290,23 +282,12 @@ class MergeTemporalSegments(BaseTool):
             return {"merged_segments": [], "result": "No temporal segments were provided."}
         
         try:
-            sorted_segments = sorted(segments, key=lambda s: s.get("start", 0))
-            merged = []
-            current = dict(sorted_segments[0])
-            
-            for seg in sorted_segments[1:]:
-                start = seg.get("start", 0)
-                end = seg.get("end", 0)
-                if start <= current.get("end", 0) + tolerance:
-                    current["end"] = max(current.get("end", 0), end)
-                    current.setdefault("sources", []).extend(seg.get("sources", []))  # optional provenance merge
-                else:
-                    merged.append(current)
-                    current = dict(seg)
-            merged.append(current)
+            from toolkit.impl.meta_tools import h_merge_touching
+
+            merged = h_merge_touching(segments, tolerance=tolerance)
         except Exception as e:
             logger.error(f"Merge_Temporal_Segments failed: {e}")
-            merged = segments
+            return {"status": "error", "error": str(e), "result": f"Temporal merge failed: {e}"}
         
         logger.info(f"Merge_Temporal_Segments: merged {len(segments)} -> {len(merged)}")
         return enrich_tool_result(

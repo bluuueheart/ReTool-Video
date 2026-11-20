@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import uuid
 import unicodedata
 from contextlib import contextmanager, nullcontext
 from typing import List, Dict, Any, Optional, Iterator, Tuple
@@ -2763,6 +2764,9 @@ class TransformersProvider(BaseLLM):
     ) -> str:
         from config.settings import settings
 
+        metrics_started = time.perf_counter()
+        metrics_recorded = False
+
         generation_enable_thinking = _resolve_enable_thinking_for_role(
             self.model_role,
             kwargs.pop("enable_thinking", None),
@@ -3063,6 +3067,17 @@ class TransformersProvider(BaseLLM):
                 logger.debug("Failed to compute generation token diagnostics: %s", e)
 
             generated_ids = output[0][input_length:]
+            try:
+                from .inference_metrics import emit
+                emit(kind="llm_local_generation", provider_role=self.model_role,
+                    model=self.model_name, backend="transformers", status="success",
+                    elapsed_seconds=time.perf_counter() - metrics_started,
+                    usage={"prompt_tokens": input_length, "completion_tokens": len(generated_ids),
+                           "total_tokens": input_length + len(generated_ids)},
+                    token_count_source="actual_input_ids_and_generated_ids")
+                metrics_recorded = True
+            except Exception:
+                pass
             text = self._decode_generation_tokens(
                 generated_ids,
                 use_multimodal_prompt=use_multimodal_prompt,
@@ -3085,6 +3100,11 @@ class TransformersProvider(BaseLLM):
                 text = text.split(prompt, 1)[1].strip()
             return text
         finally:
+            if not metrics_recorded and os.environ.get("TOOLSTAR_INFERENCE_METRICS") == "1":
+                from .inference_metrics import emit
+                emit(kind="llm_local_generation", provider_role=self.model_role,
+                    model=self.model_name, backend="transformers", status="error", usage=None,
+                    elapsed_seconds=time.perf_counter() - metrics_started)
             if use_multimodal_prompt:
                 input_ids = None
                 output = None
@@ -3187,6 +3207,9 @@ class OpenAIProvider(BaseLLM):
         """
         request_base_url = "<unselected>"
         request_summary = "<unbuilt>"
+        metrics_started = time.perf_counter()
+        metrics_call_id = str(uuid.uuid4())
+        request_payload = {}
         try:
             with self._borrow_chat_client() as (client, request_base_url):
                 request_kwargs = dict(kwargs)
@@ -3244,8 +3267,23 @@ class OpenAIProvider(BaseLLM):
                     **request_payload,
                     **request_kwargs
                 )
-            return response.choices[0].message.content
+            from .inference_metrics import record_request
+            record_request(provider_role=self.model_role, call_id=metrics_call_id, attempt=1,
+                attempt_started=metrics_started, generation_started=metrics_started,
+                payload=request_payload, endpoint=request_base_url, response=response, final_attempt=True)
+            from .response_metadata import record_response_reasoning
+            message = response.choices[0].message
+            extra = getattr(message, "model_extra", None) or {}
+            record_response_reasoning(
+                getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+                or extra.get("reasoning_content") or extra.get("reasoning")
+            )
+            return message.content
         except Exception as e:
+            from .inference_metrics import record_request
+            record_request(provider_role=self.model_role, call_id=metrics_call_id, attempt=1,
+                attempt_started=metrics_started, generation_started=metrics_started,
+                payload=request_payload, endpoint=request_base_url, error=e, final_attempt=True)
             logger.error(
                 "OpenAI API error on base_url=%s role=%s request=%s: %s",
                 request_base_url,
@@ -3638,6 +3676,13 @@ def get_llm_provider(provider: Optional[str] = None, model_name: Optional[str] =
     Returns:
         LLM provider instance
     """
+    # An explicitly configured shared checkpoint must also serve tool roles;
+    # otherwise generic non-planner defaults can route them to an absent sidecar.
+    if provider is None and model_name is not None:
+        from core.llm.vllm_provider import get_vllm_provider, vllm_serves_model
+        if vllm_serves_model(model_name):
+            return get_vllm_provider(model_name=model_name, model_role=kwargs.get("model_role"),
+                                     **{key: value for key, value in kwargs.items() if key != "model_role"})
     resolved_provider = provider or settings.llm_provider
     requested_role = str(kwargs.get("model_role", "") or "").strip().lower()
     raw_requested_provider = str(resolved_provider or "").strip().lower()
@@ -3694,6 +3739,11 @@ def get_llm_provider(provider: Optional[str] = None, model_name: Optional[str] =
         from runtime.session import runtime_session
 
         requested_role = str(kwargs.get("model_role", "") or "").strip().lower()
+        # TOOLSTAR_LLM_BACKEND=vllm: every role that uses the served checkpoint goes to the shared vLLM replicas.
+        from core.llm.vllm_provider import get_vllm_provider, vllm_serves_model
+
+        if vllm_serves_model(kwargs.get("model_name")):
+            return get_vllm_provider(**kwargs)
         share_planner_subagent = _should_share_planner_subagent_provider(
             kwargs.get("model_name"),
             requested_role,

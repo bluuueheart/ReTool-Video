@@ -33,7 +33,9 @@ from config.settings import settings
 from config.device_config import initialize_device, detect_device, get_accelerator_snapshot
 from core.sidecar_pool import OpenAIEndpointPool, format_endpoint_list
 from runtime.session import runtime_session
+from core.llm.inference_metrics import metered_stage
 from toolkit.base import infer_primary_tool_type
+from toolkit.behavior_metrics import CONTROL_ACTIONS, DISCOVERY_TOOLS, action_tool_names, explicit_dependency_metrics
 from toolkit.impl.visual_prompts import truncate_think_tail_preserving_outer_text
 
 
@@ -1206,21 +1208,27 @@ def _build_tool_entry(tool_name: str) -> Dict[str, Any]:
     }
 
 
-def _iter_trajectory_steps(trajectory: Optional[Dict[str, Any]]):
+def _iter_trajectory_steps(trajectory: Optional[Dict[str, Any]], _seen=None):
     if not isinstance(trajectory, dict):
         return
+    if _seen is None:
+        _seen = set()
+    key = trajectory.get("task_id") or id(trajectory)
+    if key in _seen:
+        return
+    _seen.add(key)
     for step in trajectory.get("steps", []) or []:
         if not isinstance(step, dict):
             continue
         yield step
         sub_trajectory = step.get("sub_trajectory")
         if isinstance(sub_trajectory, dict):
-            yield from _iter_trajectory_steps(sub_trajectory)
+            yield from _iter_trajectory_steps(sub_trajectory, _seen)
         sub_trajectories = step.get("sub_trajectories")
         if isinstance(sub_trajectories, list):
             for child_trajectory in sub_trajectories:
                 if isinstance(child_trajectory, dict):
-                    yield from _iter_trajectory_steps(child_trajectory)
+                    yield from _iter_trajectory_steps(child_trajectory, _seen)
 
 
 def _iter_parallel_child_observation_items(value: Any):
@@ -1289,12 +1297,7 @@ def _extract_parallel_batch_tool_names(step: Dict[str, Any]) -> List[str]:
 
 
 def _extract_step_action_tool_names(step: Dict[str, Any]) -> List[str]:
-    action = str(step.get("action", "")).strip()
-    if not action or action in {"Finish", "System", "Assistant_Note"}:
-        return []
-    if action == "Parallel":
-        return _extract_parallel_batch_tool_names(step)
-    return [action]
+    return action_tool_names(str(step.get("action", "")).strip(), step.get("action_args") or {})
 
 
 def _summarize_tool_entries(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1417,26 +1420,13 @@ def _build_agent_metrics(trajectory: Optional[Dict[str, Any]]) -> Dict[str, Any]
             total += 1
         return total
 
-    def _count_subagent_action_tools(current_trajectory: Optional[Dict[str, Any]]) -> int:
-        if not isinstance(current_trajectory, dict):
-            return 0
-        total = 0
-        for step in _iter_trajectory_steps(current_trajectory):
-            depth = int(step.get("depth", 0) or 0)
-            if depth <= 0:
-                continue
-            total += len(_extract_step_action_tool_names(step))
-        return total
-
-    def _has_parallel_subagent_decomposition(current_trajectory: Optional[Dict[str, Any]]) -> bool:
+    def _has_subagent_decomposition(current_trajectory: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(current_trajectory, dict):
             return False
         for step in _iter_trajectory_steps(current_trajectory):
-            if str(step.get("action", "")).strip() != "Parallel":
-                continue
-            if len(_extract_parallel_batch_tool_names(step)) > 1:
+            if len(_extract_step_action_tool_names(step)) > 1 or _iter_child_trajectories(step):
                 return True
-        return False
+        return (explicit_dependency_metrics([current_trajectory])["tracked_explicit_dependency_depth"] or 0) > 1
 
     for step in _iter_trajectory_steps(trajectory):
         action = str(step.get("action", "")).strip()
@@ -1459,15 +1449,43 @@ def _build_agent_metrics(trajectory: Optional[Dict[str, Any]]) -> Dict[str, Any]
         child_trajectories = _iter_child_trajectories(step)
         if child_trajectories:
             delegated_root_steps += 1
-            child_tool_count = sum(_count_subagent_action_tools(child) for child in child_trajectories)
-            if child_tool_count > len(planned_tools) or any(
-                _has_parallel_subagent_decomposition(child)
+            if any(
+                _has_subagent_decomposition(child)
                 for child in child_trajectories
             ):
                 decomposed_root_steps += 1
 
     runtime_entries = _collect_runtime_entries(trajectory)
     runtime_execution_steps = _count_runtime_execution_steps(trajectory)
+    unique_trajectories = []
+    seen_trajectories = set()
+    def _visit(current):
+        if not isinstance(current, dict):
+            return
+        key = current.get("task_id") or id(current)
+        if key in seen_trajectories:
+            return
+        seen_trajectories.add(key)
+        unique_trajectories.append(current)
+        for step in current.get("steps", []) or []:
+            for child in _iter_child_trajectories(step):
+                _visit(child)
+    _visit(trajectory)
+    has_execution_events = bool(unique_trajectories) and all(
+        isinstance(t.get("tool_execution_events"), list) for t in unique_trajectories
+    )
+    execution_events = [e for t in unique_trajectories for e in t.get("tool_execution_events", [])]
+    if has_execution_events:
+        runtime_entries = [_build_tool_entry(e["tool"]) for e in execution_events if e.get("executed") is True]
+        runtime_execution_steps = len({
+            (i, e.get("iteration")) for i, t in enumerate(unique_trajectories)
+            for e in t.get("tool_execution_events", []) if e.get("executed") is True
+        })
+    all_debug_events = [e for t in unique_trajectories for e in t.get("debug_events", [])]
+    iteration_events = [e for e in all_debug_events if e.get("type") == "llm_call"] or [e for e in all_debug_events if e.get("type") == "llm_iteration"]
+    if iteration_events:
+        planner_iterations = sum(int(e.get("depth", 0)) == 0 for e in iteration_events)
+        subagent_iterations = len(iteration_events) - planner_iterations
     if isinstance(trajectory, dict):
         for step in _iter_trajectory_steps(trajectory):
             action = str(step.get("action", "")).strip()
@@ -1478,13 +1496,60 @@ def _build_agent_metrics(trajectory: Optional[Dict[str, Any]]) -> Dict[str, Any]
                 parallel_concrete_batches += 1
 
     planner_summary = _summarize_tool_entries(planner_entries)
+    if has_execution_events:
+        parallel_concrete_batches = 0
+        multi_tool_generations = 0
+        parallel_search_batches = 0
+        for t in unique_trajectories:
+            counts_by_iteration = {}
+            dispatches = {}
+            search_dispatches = {}
+            for e in t.get("tool_execution_events", []):
+                if e.get("executed") is True:
+                    if e["tool"] in DISCOVERY_TOOLS:
+                        if e.get("dispatch_mode") == "parallel":
+                            key = e.get("dispatch_group")
+                            search_dispatches[key] = search_dispatches.get(key, 0) + 1
+                    elif e["tool"] not in CONTROL_ACTIONS:
+                        key = e.get("iteration")
+                        counts_by_iteration[key] = counts_by_iteration.get(key, 0) + 1
+                        if e.get("dispatch_mode") == "parallel":
+                            group = e.get("dispatch_group")
+                            dispatches[group] = dispatches.get(group, 0) + 1
+            multi_tool_generations += sum(n > 1 for n in counts_by_iteration.values())
+            parallel_concrete_batches += sum(n > 1 for n in dispatches.values())
+            parallel_search_batches += sum(n > 1 for n in search_dispatches.values())
     subagent_summary = _summarize_tool_entries(subagent_entries)
-    runtime_summary = _summarize_tool_entries(runtime_entries)
+    runtime_summary = _summarize_tool_entries([e for e in runtime_entries if e["name"] not in CONTROL_ACTIONS])
     unique_runtime_tools = int(runtime_summary.get("unique_tool_count", 0) or 0)
     runtime_tool_call_count = len(runtime_entries)
+    dispatch_known = has_execution_events and all("dispatch_mode" in e for e in execution_events)
+    capability_steps = len({(t.get("task_id"), e.get("iteration")) for t in unique_trajectories
+                            for e in t.get("tool_execution_events", [])
+                            if e.get("executed") and e["tool"] not in CONTROL_ACTIONS})
     unique_tool_threshold = max(1, int(getattr(settings, "acceptance_min_unique_runtime_tools", 4) or 4))
 
     return {
+        **explicit_dependency_metrics(unique_trajectories),
+        "resolver_search_budget_tracking_available": any(
+            "resolver_search_round_limit" in e for e in iteration_events),
+        "resolver_search_round_count": sum(e.get("type") == "resolver_search_round" for e in all_debug_events)
+            if any("resolver_search_round_limit" in e for e in iteration_events) else None,
+        "resolver_search_budget_rejections": sum(e.get("type") == "resolver_search_budget_rejected" for e in all_debug_events)
+            if any("resolver_search_round_limit" in e for e in iteration_events) else None,
+        "resolver_search_rounds_by_task": {
+            t["task_id"]: sum(e.get("type") == "resolver_search_round" for e in t.get("debug_events", []))
+            for t in unique_trajectories if t.get("depth", 0) > 0 and any(
+                "resolver_search_round_limit" in e for e in t.get("debug_events", []))},
+        "max_resolver_depth": max((t.get("depth", 0) for t in unique_trajectories), default=0),
+        "max_execution_tree_depth": max((e.get("plan_depth", 1) for e in execution_events
+                                         if e.get("executed") and e["tool"] not in CONTROL_ACTIONS), default=0),
+        "runtime_capability_tool_call_count": sum(e["name"] not in CONTROL_ACTIONS for e in runtime_entries),
+        "runtime_discovery_call_count": sum(e["name"] in DISCOVERY_TOOLS for e in runtime_entries),
+        "runtime_capability_execution_steps": capability_steps if has_execution_events else None,
+        "multi_tool_generations": multi_tool_generations if has_execution_events else None,
+        "parallel_search_batches": parallel_search_batches if dispatch_known else None,
+        "parallelism_count_source": "dispatch_events" if dispatch_known else "unavailable_for_legacy_events",
         "tool_usage_layers": {
             "planner_proposed": planner_summary,
             "subagent_rewritten": subagent_summary,
@@ -1496,6 +1561,11 @@ def _build_agent_metrics(trajectory: Optional[Dict[str, Any]]) -> Dict[str, Any]
         "tool_type_counts": runtime_summary.get("tool_type_counts", {}),
         "capability_tier_counts": runtime_summary.get("capability_tier_counts", {}),
         "runtime_tool_call_count": runtime_tool_call_count,
+        "runtime_tool_count_source": "execution_events" if has_execution_events else "legacy_trajectory_estimate",
+        "runtime_tool_attempt_count": len(execution_events) if has_execution_events else None,
+        "runtime_successful_tool_calls": sum(e.get("executed") is True and e.get("status") == "success" for e in execution_events) if has_execution_events else None,
+        "runtime_synthetic_result_count": sum(e.get("source") == "synthetic_result" for e in execution_events) if has_execution_events else None,
+        "iteration_count_source": "llm_call_events" if any(e.get("type") == "llm_call" for e in all_debug_events) else ("llm_iteration_events" if iteration_events else "trajectory_steps_estimate"),
         "runtime_execution_steps": runtime_execution_steps,
         "planner_iterations": planner_iterations,
         "subagent_iterations": subagent_iterations,
@@ -1505,15 +1575,15 @@ def _build_agent_metrics(trajectory: Optional[Dict[str, Any]]) -> Dict[str, Any]
             decomposed_root_steps / delegated_root_steps,
             4,
         ) if delegated_root_steps else 0.0,
-        "parallel_concrete_batches": parallel_concrete_batches,
+        "parallel_concrete_batches": parallel_concrete_batches if dispatch_known else None,
         "parallel_concrete_batch_rate": round(
-            parallel_concrete_batches / max(1, runtime_execution_steps),
+            parallel_concrete_batches / max(1, capability_steps),
             4,
-        ) if runtime_execution_steps else 0.0,
+        ) if dispatch_known else None,
         "acceptance_metrics": {
             "runtime_tool_call_count": runtime_tool_call_count,
             "runtime_execution_steps": runtime_execution_steps,
-            "runtime_tools_executed": runtime_tool_call_count > 0,
+            "runtime_tools_executed": any(e["name"] not in CONTROL_ACTIONS for e in runtime_entries),
             "unique_runtime_tools_count": unique_runtime_tools,
             f"unique_runtime_tools_gte_{unique_tool_threshold}": unique_runtime_tools >= unique_tool_threshold,
             "runtime_base_meta_coverage": runtime_summary.get("base_meta_coverage", {}),
@@ -1935,13 +2005,14 @@ def _resolve_grounding_source_video_path(
     return None
 
 
+@metered_stage("initial_videoqa", phase="initial_videoqa")
 def _build_grounding_video_clip_qa_baseline(
     *,
     query: str,
     preprocessing_result: Dict[str, Any],
     processed_dir: Path,
     video_end_time: Optional[float],
-) -> Optional[Dict[str, str]]:
+) -> Optional[Dict[str, Any]]:
     if video_end_time is None or float(video_end_time) <= 0:
         return None
 
@@ -1963,7 +2034,7 @@ def _build_grounding_video_clip_qa_baseline(
         logger.warning("Planner grounding Video_Clip_QA baseline failed for %s: %s", video_path, exc)
         return None
 
-    baseline_answer = _truncate_grounding_think_tail(
+    baseline_answer = str(
         (qa_result or {}).get("answer")
         or (qa_result or {}).get("result")
         or ""
@@ -1978,9 +2049,11 @@ def _build_grounding_video_clip_qa_baseline(
 
     warning_text = " ".join(str((qa_result or {}).get("warning") or "").split()).strip()
     return {
+        **qa_result,
         "time_range": f"0.0-{float(video_end_time):.3f}",
         "answer": baseline_answer,
         "warning": warning_text,
+        "reasoning": str(qa_result.get("reasoning") or ""),
     }
 
 
@@ -2104,15 +2177,21 @@ def _build_planner_grounding_context(
             video_end_time=entire_video_end_time,
         )
         if baseline_video_qa is not None:
-            baseline_lines = [
-                "[Grounding Video_Clip_QA Baseline]",
-                f"time: {baseline_video_qa['time_range']}",
-                "answer:",
-                baseline_video_qa["answer"],
-            ]
-            if baseline_video_qa.get("warning"):
-                baseline_lines.append("warning: " + _truncate_text(baseline_video_qa["warning"], max_chars=600))
-            content.append({"type": "text", "text": "\n".join(baseline_lines)})
+            # Keep a text rendering for direct-answer mode and logging. The agent
+            # engine consumes the metadata as a pre-executed call + Observation.
+            initial_tool_result = {
+                "tool": "Video_Clip_QA",
+                "params": {"start_time": 0.0, "end_time": float(entire_video_end_time), "query": query},
+                "status": "success",
+                "result": baseline_video_qa,
+            }
+            content.append({
+                "type": "text",
+                "text": "[Initial whole-video tool result]\n" + json.dumps(
+                    {"Observation": [initial_tool_result]}, ensure_ascii=False
+                ),
+                "initial_tool_result": initial_tool_result,
+            })
 
     total_image_limit = visual_helpers["planner_image_attachment_limit"](text_hint="\n".join(intro_lines))
     remaining_image_budget = max(1, total_image_limit)

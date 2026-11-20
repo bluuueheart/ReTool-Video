@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 _RESPONSE_SCHEMA_KEYS = frozenset((
     "Actions", "actions", "Action", "action",
     "Thought", "thought", "Plan", "plan",
-    "Finish", "finish",
-    "Result", "result",
+    "Finish", "finish", "Return", "return",
+    "Result", "result", "Search", "search",
 ))
 
 
@@ -247,6 +247,9 @@ class ReactAgent:
                 direct_actions = self._parse_actions_payload(json_payload)
                 if direct_actions:
                     parsed_name, parsed_args = direct_actions[0]
+                    if parsed_name.lower() == "search":
+                        return thought, plan, "Resolver_Turn", {"nodes": [], "searches": [
+                            {k: v for k, v in parsed_args.items() if k in {"id", "intent_description", "scopes"}}]}
                     logger.debug(
                         "Parsed direct action payload - Thought: %s | Plan: %s | Action: %s | Args: %s",
                         thought,
@@ -274,6 +277,36 @@ class ReactAgent:
                 or json_payload.get("actions")
                 or json_payload.get("动作列表")
             )
+            if isinstance(json_actions, list) and len(json_actions) == 1 and isinstance(json_actions[0], dict):
+                control = str(self._extract_tool_name_from_action_payload(json_actions[0]) or "").lower()
+                if control in {"return", "resolver_return", "finish"} and "children" not in json_actions[0]:
+                    params, _, _ = self._extract_action_params_payload(json_actions[0])
+                    return thought, plan, "Finish" if control == "finish" else "Resolver_Return", params
+            # Some adapters wrap the Search control field in Actions. Normalize the
+            # envelope without inventing a query or scope, rather than delegating Search.
+            wrapped_searches, remaining_actions = [], []
+            for node in json_actions if isinstance(json_actions, list) else []:
+                if isinstance(node, dict) and isinstance(node.get("Search"), list) and not node.get("tool"):
+                    wrapped_searches.extend(node["Search"])
+                elif isinstance(node, dict) and str(self._extract_tool_name_from_action_payload(node) or "").lower() == "search":
+                    params, _, _ = self._extract_action_params_payload(node)
+                    wrapped_searches.append({k: v for k, v in params.items() if k in {"id", "intent_description", "scopes"}})
+                else:
+                    remaining_actions.append(node)
+            if wrapped_searches:
+                existing = json_payload.get("Search", json_payload.get("search", []))
+                if isinstance(existing, list):
+                    return thought, plan, "Resolver_Turn", {"nodes": remaining_actions, "searches": existing + wrapped_searches}
+            if ("Search" in json_payload or "search" in json_payload) and json_payload.get("Search", json_payload.get("search")) != []:
+                return thought, plan, "Resolver_Turn", {
+                    "nodes": json_actions or [],
+                    "searches": json_payload.get("Search", json_payload.get("search")),
+                }
+            if isinstance(json_actions, list) and any(isinstance(node, dict) and
+                    ("search_id" in node or "id" in node) for node in json_actions):
+                return thought, plan, "Execute_Plan", {"nodes": json_actions}
+            if isinstance(json_actions, list) and any(isinstance(node, dict) and "children" in node for node in json_actions):
+                return thought, plan, "Execute_Plan", {"nodes": json_actions}
             parsed_batch = self._parse_actions_payload(json_actions)
             json_finish = json_payload.get("Finish")
             if json_finish is None:
@@ -322,6 +355,11 @@ class ReactAgent:
                     parsed_args,
                 )
                 return thought, plan, parsed_name, parsed_args
+            resolver_return = json_payload.get("Return", json_payload.get("return"))
+            if resolver_return is not None:
+                return thought, plan, "Resolver_Return", (
+                    dict(resolver_return) if isinstance(resolver_return, dict) else {"result": resolver_return}
+                )
             finish_args = self._normalize_finish_payload(json_finish)
             if not finish_args and json_result not in (None, "", [], {}):
                 finish_args = self._normalize_finish_payload({"result": json_result})
@@ -567,6 +605,14 @@ class ReactAgent:
             params, raw_param_keys, raw_declared = self._extract_action_params_payload(item)
             if not isinstance(tool_name, str):
                 continue
+            if tool_name.lower() == "parallel":
+                children = params.get("batch")
+                if isinstance(children, list) and children and all(
+                    isinstance(child, dict) and self._extract_tool_name_from_action_payload(child)
+                    for child in children
+                ):
+                    parsed.extend(self._parse_actions_payload(children))
+                    continue
             params = self._attach_runtime_param_metadata(params, raw_param_keys, raw_declared)
             # Preserve planner's description for subagent decomposition
             desc = item.get("description", "")
