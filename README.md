@@ -1,5 +1,7 @@
 # ReTool-Video
 
+[Paper on arXiv](https://arxiv.org/abs/2605.13228)
+
 ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release includes the inference pipeline and a Mix evaluator for MVBench, MLVU, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
 
 ## Quickstart
