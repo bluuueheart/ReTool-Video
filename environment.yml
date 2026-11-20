@@ -4,14 +4,20 @@ channels:
 dependencies:
   - python=3.11
   - ffmpeg
+  - jq
+  - libgl
+  - libglib
+  - unzip
   - pip
   - pip:
       - accelerate==1.12.0
       - anthropic==0.76.0
+      - ctranslate2==4.6.3
       - duckdb==1.4.4
       - duckduckgo-search==8.1.1
       - faster-whisper==1.2.1
       - filelock==3.25.2
+      - huggingface-hub==1.11.0
       - jsonschema==4.25.1
       - modelscope==1.33.0
       - moviepy==2.2.1

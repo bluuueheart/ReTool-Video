@@ -379,7 +379,7 @@ def _local_sidecar_log_tail(base_url: str, model_role: Optional[str], line_count
     if not log_dir.exists():
         return ""
     try:
-        base_port = int(os.environ.get("TOOL_STAR_NON_PLANNER_SIDECAR_PORT", "18000") or "18000")
+        base_port = int(os.environ.get("RETOOL_VIDEO_NON_PLANNER_SIDECAR_PORT", "18000") or "18000")
     except (TypeError, ValueError):
         base_port = 18000
     try:
@@ -794,7 +794,7 @@ def _non_planner_role_can_use_sidecar(model_role: Optional[str]) -> bool:
 
 
 def _runtime_profile_forces_local_non_planner_runtime() -> bool:
-    normalized = str(os.environ.get("TOOL_STAR_RUNTIME_PROFILE", "") or "").strip().lower()
+    normalized = str(os.environ.get("RETOOL_VIDEO_RUNTIME_PROFILE", "") or "").strip().lower()
     return normalized in {
         "evaluation_local",
         "evaluation-local",
@@ -811,15 +811,15 @@ def _non_planner_service_provider(model_role: Optional[str]) -> str:
     if role_key:
         role_values.extend(
             [
-                os.environ.get(f"TOOL_STAR_{role_key}_MODEL_PROVIDER"),
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_PROVIDER"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_MODEL_PROVIDER"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_PROVIDER"),
             ]
         )
     return _normalize_aux_provider_name(
         _first_nonempty(
             *role_values,
-            os.environ.get("TOOL_STAR_NON_PLANNER_MODEL_PROVIDER"),
-            os.environ.get("TOOL_STAR_AUX_MODEL_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_MODEL_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_AUX_MODEL_PROVIDER"),
             _settings_role_mapping_value("non_planner_role_providers", model_role),
             getattr(settings, "non_planner_model_provider", "auto"),
         )
@@ -832,16 +832,16 @@ def _non_planner_service_api_base(model_role: Optional[str], *, include_openai_f
     if role_key:
         role_values.extend(
             [
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_BASE"),
-                os.environ.get(f"TOOL_STAR_{role_key}_API_BASE"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_BASE"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_API_BASE"),
             ]
         )
     values = [
         *role_values,
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_BASE"),
         _settings_role_mapping_value("non_planner_role_api_bases", model_role),
         getattr(settings, "non_planner_api_base", ""),
     ]
@@ -856,22 +856,22 @@ def _non_planner_service_api_bases(model_role: Optional[str], *, include_openai_
     if role_key:
         role_values.extend(
             [
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_BASES"),
-                os.environ.get(f"TOOL_STAR_{role_key}_API_BASES"),
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_BASE"),
-                os.environ.get(f"TOOL_STAR_{role_key}_API_BASE"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_BASES"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_API_BASES"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_BASE"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_API_BASE"),
             ]
         )
     values = [
         *role_values,
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_BASES"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_BASES"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_BASES"),
-        os.environ.get("TOOL_STAR_AUX_API_BASES"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_BASE"),
         _settings_role_mapping_value("non_planner_role_api_bases", model_role),
         getattr(settings, "non_planner_api_bases", ""),
         getattr(settings, "non_planner_api_base", ""),
@@ -887,18 +887,18 @@ def _non_planner_service_api_key(model_role: Optional[str]) -> str:
     if role_key:
         role_values.extend(
             [
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_KEY"),
-                os.environ.get(f"TOOL_STAR_{role_key}_API_KEY"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_KEY"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_API_KEY"),
             ]
         )
     return _first_nonempty(
         *role_values,
         _settings_role_mapping_value("non_planner_role_api_keys", model_role),
         getattr(settings, "non_planner_api_key", ""),
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_KEY"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_KEY"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_KEY"),
-        os.environ.get("TOOL_STAR_AUX_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_KEY"),
         getattr(settings, "openai_api_key", ""),
         "EMPTY",
     )
@@ -910,16 +910,16 @@ def _non_planner_service_model(model_role: Optional[str], *, include_openai_fall
     if role_key:
         role_values.extend(
             [
-                os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_MODEL"),
-                os.environ.get(f"TOOL_STAR_{role_key}_MODEL"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_MODEL"),
+                os.environ.get(f"RETOOL_VIDEO_{role_key}_MODEL"),
             ]
         )
     values = [
         *role_values,
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_MODEL"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_MODEL"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_MODEL"),
-        os.environ.get("TOOL_STAR_AUX_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_MODEL"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_MODEL"),
+        os.environ.get("RETOOL_VIDEO_AUX_MODEL"),
         _settings_role_mapping_value("non_planner_role_models", model_role),
         getattr(settings, "non_planner_model", ""),
         _default_non_planner_service_model(model_role),
@@ -939,9 +939,9 @@ def _resolve_non_planner_service_kwargs(
         return None
     if _runtime_profile_forces_local_non_planner_runtime():
         logger.info(
-            "Skipping non-planner sidecar routing for role=%s because TOOL_STAR_RUNTIME_PROFILE=%s forces local evaluation runtime.",
+            "Skipping non-planner sidecar routing for role=%s because RETOOL_VIDEO_RUNTIME_PROFILE=%s forces local evaluation runtime.",
             str(model_role or "").strip().lower(),
-            str(os.environ.get("TOOL_STAR_RUNTIME_PROFILE", "") or "").strip(),
+            str(os.environ.get("RETOOL_VIDEO_RUNTIME_PROFILE", "") or "").strip(),
         )
         return None
 
@@ -3100,7 +3100,7 @@ class TransformersProvider(BaseLLM):
                 text = text.split(prompt, 1)[1].strip()
             return text
         finally:
-            if not metrics_recorded and os.environ.get("TOOLSTAR_INFERENCE_METRICS") == "1":
+            if not metrics_recorded and os.environ.get("RETOOL_VIDEO_INFERENCE_METRICS") == "1":
                 from .inference_metrics import emit
                 emit(kind="llm_local_generation", provider_role=self.model_role,
                     model=self.model_name, backend="transformers", status="error", usage=None,
@@ -3739,7 +3739,7 @@ def get_llm_provider(provider: Optional[str] = None, model_name: Optional[str] =
         from runtime.session import runtime_session
 
         requested_role = str(kwargs.get("model_role", "") or "").strip().lower()
-        # TOOLSTAR_LLM_BACKEND=vllm: every role that uses the served checkpoint goes to the shared vLLM replicas.
+        # RETOOL_VIDEO_LLM_BACKEND=vllm: every role that uses the served checkpoint goes to the shared vLLM replicas.
         from core.llm.vllm_provider import get_vllm_provider, vllm_serves_model
 
         if vllm_serves_model(kwargs.get("model_name")):

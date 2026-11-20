@@ -1562,9 +1562,9 @@ def _big_decode_slot(video_path: Path):
 
     vLLM decodes every frame of a video file before sampling it, so a long 25-30 fps video needs hundreds of GB of
     host memory; several at once exhaust the container. Each call reserves its decoded size in a cross-process ledger
-    and waits for room in the shared TOOLSTAR_DECODE_BUDGET_GB budget.
+    and waits for room in the shared RETOOL_VIDEO_DECODE_BUDGET_GB budget.
     """
-    budget = float(os.environ.get("TOOLSTAR_DECODE_BUDGET_GB", "600")) * 1e9
+    budget = float(os.environ.get("RETOOL_VIDEO_DECODE_BUDGET_GB", "600")) * 1e9
     try:
         import cv2
 
@@ -1581,8 +1581,8 @@ def _big_decode_slot(video_path: Path):
     if size <= 0:
         yield
         return
-    size *= float(os.environ.get("TOOLSTAR_DECODE_OVERHEAD", "1.3"))
-    max_gb = float(os.environ.get("TOOLSTAR_DECODE_MAX_GB", "900"))
+    size *= float(os.environ.get("RETOOL_VIDEO_DECODE_OVERHEAD", "1.3"))
+    max_gb = float(os.environ.get("RETOOL_VIDEO_DECODE_MAX_GB", "900"))
     if size > max_gb * 1e9:
         raise WholeVideoTooLarge(
             f"decoding {Path(video_path).name} needs ~{size / 1e9:.0f} GB, above the {max_gb:.0f} GB cap",
@@ -1592,8 +1592,8 @@ def _big_decode_slot(video_path: Path):
     from filelock import FileLock
 
     ledger_path = Path(
-        os.environ.get("TOOLSTAR_DECODE_LEDGER")
-        or Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "toolstar_decode_ledger.json"
+        os.environ.get("RETOOL_VIDEO_DECODE_LEDGER")
+        or Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "retool_video_decode_ledger.json"
     )
     lock = FileLock(str(ledger_path) + ".lock")
     token = f"{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
@@ -1662,13 +1662,13 @@ def _downsample_video_for_whole_qa(video_path: Path, target_fps: float) -> Optio
     binary = ffmpeg_binary()
     if not binary:
         return None
-    height = int(os.environ.get("TOOLSTAR_VIDEO_QA_DOWNSAMPLE_HEIGHT", "480") or 480)
+    height = int(os.environ.get("RETOOL_VIDEO_VIDEO_QA_DOWNSAMPLE_HEIGHT", "480") or 480)
     stat = video_path.stat()
     key = hashlib.sha1(
         f"{video_path}|{stat.st_mtime_ns}|{stat.st_size}|{target_fps:.4f}|{height}".encode("utf-8")
     ).hexdigest()[:20]
     cache_dir = Path(
-        os.environ.get("TOOLSTAR_VIDEO_QA_CACHE_DIR")
+        os.environ.get("RETOOL_VIDEO_VIDEO_QA_CACHE_DIR")
         or Path(__file__).resolve().parents[3] / "local_runs" / "video_qa_cache"
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1704,7 +1704,7 @@ def pop_last_clip_qa_reasoning() -> str:
 
 
 def _video_clip_qa_thinking_enabled() -> bool:
-    raw = os.environ.get("TOOLSTAR_VIDEO_CLIP_QA_THINKING")
+    raw = os.environ.get("RETOOL_VIDEO_VIDEO_CLIP_QA_THINKING")
     if raw is not None and str(raw).strip() != "":
         return str(raw).strip().lower() not in {"0", "false", "no", "off"}
     return bool(getattr(settings, "video_clip_qa_enable_thinking", True))
@@ -1788,11 +1788,11 @@ def _answer_video_clip_qa_with_provider(
         source_path = Path(clip_path).expanduser().resolve()
         duration_s, decode_bytes = _video_duration_and_decode_bytes(source_path)
         if duration_s > 0:
-            tokens_per_frame = float(os.environ.get("TOOLSTAR_VIDEO_TOKENS_PER_FRAME", "80") or 80)
-            input_budget = float(os.environ.get("TOOLSTAR_VIDEO_QA_INPUT_TOKEN_BUDGET", "228000") or 228000)
+            tokens_per_frame = float(os.environ.get("RETOOL_VIDEO_VIDEO_TOKENS_PER_FRAME", "80") or 80)
+            input_budget = float(os.environ.get("RETOOL_VIDEO_VIDEO_QA_INPUT_TOKEN_BUDGET", "228000") or 228000)
             fps_for_budget = input_budget / (duration_s * tokens_per_frame)
-            decode_cap = float(os.environ.get("TOOLSTAR_DECODE_MAX_GB", "900")) * 1e9
-            decode_over = decode_bytes * float(os.environ.get("TOOLSTAR_DECODE_OVERHEAD", "1.3")) > decode_cap
+            decode_cap = float(os.environ.get("RETOOL_VIDEO_DECODE_MAX_GB", "900")) * 1e9
+            decode_over = decode_bytes * float(os.environ.get("RETOOL_VIDEO_DECODE_OVERHEAD", "1.3")) > decode_cap
             if fps_for_budget < effective_fps or decode_over:
                 target_fps = max(0.05, min(effective_fps, fps_for_budget))
                 reduced = _downsample_video_for_whole_qa(source_path, target_fps)

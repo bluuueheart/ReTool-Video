@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
         dest="skip_true",
         action="store_true",
         help="Import already-correct existing per-sample results into progress state before scheduling.",
+    )
+    parser.add_argument(
+        "--check-data",
+        action="store_true",
+        help="Load all enabled datasets and report missing videos without starting inference.",
     )
     parser.add_argument(
         "--sample-uids",
@@ -286,17 +291,17 @@ def load_config(config_path: Path) -> BatchConfig:
     )
     return BatchConfig(
         config_path=config_path,
-        workspaces_root=_env_path_override(config_dir, "TOOLSTAR_WORKSPACES_ROOT_OVERRIDE", workspaces_root),
-        progress_path=_env_path_override(config_dir, "TOOLSTAR_PROGRESS_PATH_OVERRIDE", progress_path),
-        results_path=_env_path_override(config_dir, "TOOLSTAR_RESULTS_PATH_OVERRIDE", results_path),
+        workspaces_root=_env_path_override(config_dir, "RETOOL_VIDEO_WORKSPACES_ROOT_OVERRIDE", workspaces_root),
+        progress_path=_env_path_override(config_dir, "RETOOL_VIDEO_PROGRESS_PATH_OVERRIDE", progress_path),
+        results_path=_env_path_override(config_dir, "RETOOL_VIDEO_RESULTS_PATH_OVERRIDE", results_path),
         videomme_official_output_path=_env_path_override(
             config_dir,
-            "TOOLSTAR_VIDEOMME_OUTPUT_PATH_OVERRIDE",
+            "RETOOL_VIDEO_VIDEOMME_OUTPUT_PATH_OVERRIDE",
             videomme_official_output_path,
         ),
         shared_preprocess_root=_env_path_override(
             config_dir,
-            "TOOLSTAR_SHARED_PREPROCESS_ROOT_OVERRIDE",
+            "RETOOL_VIDEO_SHARED_PREPROCESS_ROOT_OVERRIDE",
             shared_preprocess_root,
         ),
         ffmpeg_binary=str(payload.get("ffmpeg_binary") or "ffmpeg"),
@@ -656,7 +661,7 @@ def _extract_worker_result_payload(stdout_text: str) -> Optional[Dict[str, Any]]
 
 
 def _visible_cuda_device_ids() -> List[str]:
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("TOOLSTAR_ALLOWED_GPUS"))
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("RETOOL_VIDEO_ALLOWED_GPUS"))
     if visible_devices is not None:
         return [device.strip() for device in visible_devices.split(",") if device.strip() and device.strip() != "-1"]
     try:
@@ -672,7 +677,7 @@ def _visible_cuda_device_ids() -> List[str]:
 def _workers_per_gpu() -> int:
     """Sample workers per visible GPU (workers mostly wait on the shared vLLM servers, so >1 overlaps them)."""
     try:
-        return max(1, int(os.environ.get("TOOLSTAR_WORKERS_PER_GPU", "1") or 1))
+        return max(1, int(os.environ.get("RETOOL_VIDEO_WORKERS_PER_GPU", "1") or 1))
     except ValueError:
         return 1
 
@@ -756,9 +761,9 @@ def _bind_worker_to_visible_cuda_device(visible_device_id: str) -> None:
         return
     os.environ["CUDA_VISIBLE_DEVICES"] = normalized_device
     for key in list(os.environ.keys()):
-        if key.startswith("TOOLSTAR_") and key.endswith("_DEVICE_ID"):
+        if key.startswith("RETOOL_VIDEO_") and key.endswith("_DEVICE_ID"):
             os.environ.pop(key, None)
-    os.environ["TOOLSTAR_DEVICE_ID"] = "0"
+    os.environ["RETOOL_VIDEO_DEVICE_ID"] = "0"
 
 
 def _run_mix_sample_worker(
@@ -859,16 +864,16 @@ def run_single_sample(
 ) -> Dict[str, Any]:
     run_e2e_module = _load_run_e2e_module()
     pipeline_options = dict(config.pipeline_options or {})
-    env_pipeline_mode = str(os.environ.get("TOOLSTAR_PIPELINE_MODE_OVERRIDE") or "").strip()
+    env_pipeline_mode = str(os.environ.get("RETOOL_VIDEO_PIPELINE_MODE_OVERRIDE") or "").strip()
     if env_pipeline_mode:
         pipeline_options["mode"] = env_pipeline_mode
-    env_single_tool_only = str(os.environ.get("TOOLSTAR_ABLATION_SINGLE_TOOL_ONLY") or "").strip().lower()
+    env_single_tool_only = str(os.environ.get("RETOOL_VIDEO_ABLATION_SINGLE_TOOL_ONLY") or "").strip().lower()
     if env_single_tool_only in {"1", "true", "yes", "on"}:
         pipeline_options["planner_toolsearch_direct_single_tool_only"] = True
-    env_single_action_per_step = str(os.environ.get("TOOLSTAR_ABLATION_SINGLE_ACTION_PER_STEP") or "").strip().lower()
+    env_single_action_per_step = str(os.environ.get("RETOOL_VIDEO_ABLATION_SINGLE_ACTION_PER_STEP") or "").strip().lower()
     if env_single_action_per_step in {"1", "true", "yes", "on"}:
         pipeline_options["planner_single_action_per_step"] = True
-    env_disable_meta_tools = str(os.environ.get("TOOLSTAR_ABLATION_DISABLE_META_TOOLS") or "").strip().lower()
+    env_disable_meta_tools = str(os.environ.get("RETOOL_VIDEO_ABLATION_DISABLE_META_TOOLS") or "").strip().lower()
     if env_disable_meta_tools in {"1", "true", "yes", "on"}:
         pipeline_options["disable_meta_tools"] = True
     workspace_root = sample.workspace_root.resolve()
@@ -1409,6 +1414,33 @@ def _execute_parallel_samples(
                     LOGGER.info("%s", build_acc_line(cumulative_results, dataset_order))
 
 
+def check_dataset_files(inventories: Sequence[DatasetInventory]) -> bool:
+    complete = True
+    for inventory in inventories:
+        question_count = 0
+        missing_by_subset: Counter[str] = Counter()
+        missing_paths: Set[Path] = set()
+        for subset_name, samples in inventory.samples_by_subset.items():
+            question_count += len(samples)
+            for sample in samples:
+                if not sample.video_path.is_file():
+                    missing_by_subset[subset_name] += 1
+                    missing_paths.add(sample.video_path)
+        LOGGER.info("%s: %d questions", inventory.dataset_name, question_count)
+        if not question_count:
+            LOGGER.error("%s: no questions loaded", inventory.dataset_name)
+        if missing_paths:
+            LOGGER.error(
+                "%s: %d missing video files affect questions by subset %s; examples: %s",
+                inventory.dataset_name,
+                len(missing_paths),
+                dict(missing_by_subset),
+                ", ".join(str(path) for path in sorted(missing_paths)[:3]),
+            )
+        complete = complete and question_count > 0 and not missing_paths
+    return complete
+
+
 def _run_worker_mode(args: argparse.Namespace) -> None:
     if str(args.worker_device_id or "").strip():
         _bind_worker_to_visible_cuda_device(str(args.worker_device_id))
@@ -1421,8 +1453,8 @@ def _run_worker_mode(args: argparse.Namespace) -> None:
 
 def _setup_vllm_backend(args: argparse.Namespace, visible_device_ids: Sequence[str]) -> None:
     """Point every LLM role at vLLM (env is inherited by sample worker subprocesses)."""
-    urls = str(args.vllm_urls or os.environ.get("TOOLSTAR_VLLM_BASE_URLS") or "").strip()
-    backend = os.environ.get("TOOLSTAR_LLM_BACKEND", "").strip().lower()
+    urls = str(args.vllm_urls or os.environ.get("RETOOL_VIDEO_VLLM_BASE_URLS") or "").strip()
+    backend = os.environ.get("RETOOL_VIDEO_LLM_BACKEND", "").strip().lower()
     if not (args.vllm or args.vllm_urls or backend == "vllm"):
         return
 
@@ -1439,26 +1471,26 @@ def _setup_vllm_backend(args: argparse.Namespace, visible_device_ids: Sequence[s
         pool_plan = vllm_pool.ensure_pool(
             visible_device_ids,
             model=str(Path(settings.planner_model_path).resolve()),
-            stop_on_exit=not (args.keep_vllm or str(os.environ.get("TOOLSTAR_VLLM_KEEP", "")).strip() in {"1", "true"}),
+            stop_on_exit=not (args.keep_vllm or str(os.environ.get("RETOOL_VIDEO_VLLM_KEEP", "")).strip() in {"1", "true"}),
             needed_workers=None,  # bring up a replica on every visible card
         )
         urls = pool_plan["base_urls"]
-        os.environ["TOOLSTAR_VLLM_PLAN"] = str(vllm_pool.plan_path())
-        os.environ["TOOLSTAR_VLLM_MODEL"] = str(pool_plan.get("served_name") or "qwen35-9b")
-        os.environ["TOOLSTAR_VLLM_MODEL_PATH"] = str(pool_plan.get("model_path") or "")
+        os.environ["RETOOL_VIDEO_VLLM_PLAN"] = str(vllm_pool.plan_path())
+        os.environ["RETOOL_VIDEO_VLLM_MODEL"] = str(pool_plan.get("served_name") or "qwen35-9b")
+        os.environ["RETOOL_VIDEO_VLLM_MODEL_PATH"] = str(pool_plan.get("model_path") or "")
         LOGGER.info(
             "vLLM pool: %s",
             {r["device"]: f"port={r['port']} max_len={r['max_model_len']}" for r in pool_plan["replicas"]},
         )
     if not urls:
-        raise RuntimeError("vLLM selected without an endpoint. Set TOOLSTAR_VLLM_BASE_URLS or pass --vllm to launch it.")
-    os.environ["TOOLSTAR_LLM_BACKEND"] = "vllm"
-    os.environ["TOOLSTAR_VLLM_BASE_URLS"] = urls
-    os.environ.setdefault("TOOLSTAR_VLLM_MODEL_PATH", str(Path(settings.planner_model_path).resolve()))
+        raise RuntimeError("vLLM selected without an endpoint. Set RETOOL_VIDEO_VLLM_BASE_URLS or pass --vllm to launch it.")
+    os.environ["RETOOL_VIDEO_LLM_BACKEND"] = "vllm"
+    os.environ["RETOOL_VIDEO_VLLM_BASE_URLS"] = urls
+    os.environ.setdefault("RETOOL_VIDEO_VLLM_MODEL_PATH", str(Path(settings.planner_model_path).resolve()))
     LOGGER.info(
         "LLM backend=vllm base_urls=%s served_model=%s planner_max_tokens=%s max_input_tokens=%s",
         urls,
-        os.environ.get("TOOLSTAR_VLLM_MODEL", "qwen35-9b"),
+        os.environ.get("RETOOL_VIDEO_VLLM_MODEL", "qwen35-9b"),
         settings.planner_max_generation_tokens,
         settings.max_input_tokens,
     )
@@ -1475,6 +1507,10 @@ def main() -> None:
     inventories = load_inventories(config)
     if not inventories:
         raise RuntimeError("No enabled datasets found in mix config.")
+    if args.check_data:
+        if not check_dataset_files(inventories):
+            raise SystemExit(1)
+        return
     dataset_order = _inventory_dataset_order(inventories)
 
     progress_payload = load_progress(config.progress_path)

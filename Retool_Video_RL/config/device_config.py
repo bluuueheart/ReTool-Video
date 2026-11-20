@@ -111,8 +111,8 @@ def select_preferred_device_id(device_type: str = None, purpose: str = "aux") ->
 
     normalized_purpose = str(purpose or "aux").strip().upper()
     override_keys = [
-        f"TOOLSTAR_{normalized_purpose}_DEVICE_ID",
-        "TOOLSTAR_DEVICE_ID",
+        f"RETOOL_VIDEO_{normalized_purpose}_DEVICE_ID",
+        "RETOOL_VIDEO_DEVICE_ID",
     ]
     for key in override_keys:
         raw_value = os.environ.get(key, "").strip()

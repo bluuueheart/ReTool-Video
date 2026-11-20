@@ -1,10 +1,10 @@
 # ReTool-Video
 
-ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release includes the inference pipeline and a Mix evaluator for MVBench, MLVU Dev, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
+ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release includes the inference pipeline and a Mix evaluator for MVBench, MLVU, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
 
 ## Quickstart
 
-From the repository root on Linux with a CUDA-capable GPU, create the inference environment and set a local model directory. The environment includes FFmpeg and the Transformers backend.
+From the repository root on Linux with a CUDA-capable GPU, create the inference environment and set a local model directory. The environment pins the Python inference libraries and installs FFmpeg, the Hugging Face CLI, and the dataset extraction utilities.
 
 ```bash
 conda env create -f environment.yml
@@ -23,24 +23,26 @@ python Retool_Video_RL/run_e2e.py /path/to/video.mp4 \
 
 The default model directory is `./models` relative to the working directory. To configure inference with an environment file, copy `Retool_Video_RL/.env.example` to `.env` in the repository root. `RESOLVER_MAX_SEARCH_ROUNDS` sets the number of model turns per resolver node that may contain a top-level Search. The legacy `SUBAGENT_MAX_ITERATIONS` name remains accepted.
 
-Use `hf auth login` for gated checkpoints and datasets. If your CTranslate2 installation cannot use the available CUDA libraries, set `PREPROCESS_ASR_DEVICE=cpu` to run Whisper on the CPU. Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
+Run `hf auth login` before downloading gated checkpoints or datasets. GPU Whisper requires CUDA 12 cuBLAS and cuDNN 9 available to the dynamic linker. Set `PREPROCESS_ASR_DEVICE=cpu` to leave Whisper on the CPU while the video models run on CUDA. See the [Faster Whisper GPU requirements](https://github.com/SYSTRAN/faster-whisper#gpu). Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
 
 ### Optional vLLM backend
 
-The optional vLLM backend serves the planner, resolver, captioning, and visual QA. Install upstream vLLM in a separate Python environment because its Transformers requirements may differ from the inference client's. Follow [vLLM's GPU installation guide](https://docs.vllm.ai/en/v0.19.0/getting_started/installation/gpu/) and the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B).
+The optional vLLM backend serves the planner, resolver, captioning, and visual QA. Install vLLM 0.19.0 in a separate Python environment to keep its PyTorch and Transformers dependencies isolated. See the [vLLM GPU installation guide](https://docs.vllm.ai/en/v0.19.0/getting_started/installation/gpu/) for CUDA and driver requirements.
 
-Set `TOOLSTAR_VLLM_BIN` to the directory containing the installed `vllm` executable. Set `TOOLSTAR_VLLM_MEDIA_ROOT` to the smallest shared directory containing both the input videos and the generated clips and frames. For the example below, place the datasets and evaluation workspace under the repository root.
+Set `RETOOL_VIDEO_VLLM_BIN` to the directory containing the installed `vllm` executable. Set `RETOOL_VIDEO_VLLM_MEDIA_ROOT` to the smallest shared directory containing both the input videos and the generated clips and frames. For the example below, place the datasets and evaluation workspace under the repository root.
 
 ```bash
-export TOOLSTAR_VLLM_BIN=/path/to/vllm-env/bin
-export TOOLSTAR_VLLM_MEDIA_ROOT="$PWD"
+python -m venv .venv-vllm
+.venv-vllm/bin/python -m pip install "vllm==0.19.0"
+export RETOOL_VIDEO_VLLM_BIN="$PWD/.venv-vllm/bin"
+export RETOOL_VIDEO_VLLM_MEDIA_ROOT="$PWD"
 export CUDA_VISIBLE_DEVICES=0
 
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
   --vllm
 ```
 
-The launcher starts local replicas on the visible GPUs that have enough free memory. To use an existing vLLM server, pass `--vllm-urls http://127.0.0.1:8000/v1`, set `TOOLSTAR_VLLM_MODEL` to the server's served model name, and configure its `--allowed-local-media-path` to match the shared media directory. The auto-launched replicas bind to loopback.
+The launcher starts local replicas on the visible GPUs that have enough free memory. To use an existing vLLM server, pass `--vllm-urls http://127.0.0.1:8000/v1`, set `RETOOL_VIDEO_VLLM_MODEL` to the server's served model name, and configure its `--allowed-local-media-path` to match the shared media directory. The auto-launched replicas bind to loopback.
 
 ## Mix evaluation
 
@@ -49,31 +51,53 @@ The launcher starts local replicas on the visible GPUs that have enough free mem
 ```bash
 export DATA_ROOT="$PWD/datasets"
 hf download OpenGVLab/MVBench --repo-type dataset --local-dir "$DATA_ROOT/MVBench"
+for archive in "$DATA_ROOT"/MVBench/video/*.zip; do
+  unzip -nq "$archive" -d "$DATA_ROOT/MVBench/video"
+done
+
 hf download MLVU/MVLU --repo-type dataset --local-dir "$DATA_ROOT/MLVU"
 hf download VLM2Vec/Video-MME --repo-type dataset --local-dir "$DATA_ROOT/Video-MME" \
   --include "videomme/*" --include "videos_chunked_*.zip"
 
 mkdir -p "$DATA_ROOT/Video-MME/videos"
 for archive in "$DATA_ROOT"/Video-MME/videos_chunked_*.zip; do
-  unzip -q "$archive" -d "$DATA_ROOT/Video-MME/videos"
+  unzip -nq "$archive" -d "$DATA_ROOT/Video-MME/videos"
 done
 ```
 
-Extract any MVBench or MLVU video archives so the dataset paths point to playable files. Set the dataset paths in [mix_config.json](evaluationVideo/Mix/mix_config.json). Dataset roots and the MVBench annotation path are relative to the directory containing the configuration file. MLVU and Video-MME annotation and video paths are relative to their dataset roots.
+For MVBench Fine-grained Pose, obtain the 320 NTU RGB+D videos separately and place them in `datasets/MVBench/video/nturgbd/`. The upstream dataset card links to the source and the required filenames. Set the dataset paths in [mix_config.json](evaluationVideo/Mix/mix_config.json). Dataset roots and the MVBench annotation path are relative to the directory containing the configuration file. MLVU and Video-MME annotation and video paths are relative to their dataset roots.
 
 | Dataset | Set these paths |
 | --- | --- |
 | [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench) | `dataset_root` to the video directory and `json_root` to the task annotations. |
-| [MLVU Dev](https://huggingface.co/datasets/MLVU/MVLU) | `dataset_root` to the directory containing the annotations and videos. Set `annotation_root` and `video_root` to their actual locations. |
+| [MLVU](https://huggingface.co/datasets/MLVU/MVLU) | `dataset_root` to the directory containing the annotations and videos. Set `annotation_root` and `video_root` to their actual locations. |
 | [Video-MME](https://huggingface.co/datasets/VLM2Vec/Video-MME) | `dataset_root` to the download directory. Check `annotation_path`, `video_id_mapping_path`, and `video_search_roots`. |
 
-Keep model checkpoints under `MODEL_BASE_PATH` in their Hugging Face repository layout. Additional tools load their checkpoints on demand. See [settings.py](Retool_Video_RL/config/settings.py) for the paths used by audio QA, entity detection and tracking, emotion recognition, and image transforms. For speaker diarization, download `pyannote/speaker-diarization-community-1` and install `pyannote.audio`. To use a separate environment for diarization, set `DIARIZATION_PYTHON` to its Python executable.
+### Tool-specific checkpoints
+
+The Quickstart checkpoints cover the planner, core visual QA, captioning, embeddings, and ASR. The following tools load additional models on demand. To enable them, download the checkpoints with `hf download <repo-id> --local-dir "$MODEL_BASE_PATH/<repo-id>"`.
+
+| Tools | Checkpoints |
+| --- | --- |
+| Audio Clip QA and audio-based emotion analysis | `Qwen/Qwen2.5-Omni-3B` |
+| Entity tracking | `IDEA-Research/grounding-dino-base` and `facebook/sam2.1-hiera-tiny` |
+| Audio event detection | `laion/clap-htsat-fused` |
+| Speaker diarization | `pyannote/speaker-diarization-community-1` |
+
+The inference environment includes RapidOCR and ONNX Runtime for OCR. To use speaker diarization, accept the [checkpoint access terms](https://huggingface.co/pyannote/speaker-diarization-community-1), download the checkpoint as above, and install the worker dependencies in a separate Python environment:
+
+```bash
+python -m venv .venv-diarization
+.venv-diarization/bin/python -m pip install "pyannote.audio==4.0.7" "pydantic-settings==2.12.0"
+export DIARIZATION_PYTHON="$PWD/.venv-diarization/bin/python"
+```
 
 ### Run the full three-dataset evaluation
 
-The default configuration enables MVBench, MLVU Dev, and Video-MME. After setting their dataset paths, run:
+The default configuration runs every loaded question across MVBench, MLVU, and Video-MME. It uses MVBench's video-file tasks and multiple-choice questions across the three datasets. After preparing the datasets, check the files and start the evaluation:
 
 ```bash
+bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json --check-data
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json
 ```
 

@@ -440,7 +440,7 @@ class VisualProcessor:
                 valid_device_maps,
             )
         self._requested_device_map = requested_device_map if requested_device_map in valid_device_maps else None
-        requested_attn_impl = os.environ.get("TOOLSTAR_ATTN_IMPLEMENTATION", "").strip().lower()
+        requested_attn_impl = os.environ.get("RETOOL_VIDEO_ATTN_IMPLEMENTATION", "").strip().lower()
         self._requested_attn_implementation = (
             requested_attn_impl if requested_attn_impl in ("eager", "sdpa", "flash_attention_2") else None
         )
@@ -3492,7 +3492,7 @@ def _normalize_service_provider_name(provider: Any) -> str:
 
 
 def _runtime_profile_forces_local_visual_runtime() -> bool:
-    normalized = str(os.environ.get("TOOL_STAR_RUNTIME_PROFILE", "") or "").strip().lower()
+    normalized = str(os.environ.get("RETOOL_VIDEO_RUNTIME_PROFILE", "") or "").strip().lower()
     return normalized in {
         "evaluation_local",
         "evaluation-local",
@@ -3550,10 +3550,10 @@ def _visual_service_provider(model_role: str) -> str:
     role_key = _visual_role_env_key(model_role)
     return _normalize_service_provider_name(
         _first_nonempty(
-            os.environ.get(f"TOOL_STAR_{role_key}_MODEL_PROVIDER"),
-            os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_PROVIDER"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_MODEL_PROVIDER"),
-            os.environ.get("TOOL_STAR_AUX_MODEL_PROVIDER"),
+            os.environ.get(f"RETOOL_VIDEO_{role_key}_MODEL_PROVIDER"),
+            os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_MODEL_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_AUX_MODEL_PROVIDER"),
             _settings_role_mapping_value("non_planner_role_providers", model_role),
             getattr(settings, "non_planner_model_provider", "auto"),
         )
@@ -3563,18 +3563,18 @@ def _visual_service_provider(model_role: str) -> str:
 def _visual_service_base(model_role: str) -> str:
     role_key = _visual_role_env_key(model_role)
     return format_endpoint_list(_first_nonempty(
-        os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_BASES"),
-        os.environ.get(f"TOOL_STAR_{role_key}_API_BASES"),
-        os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_API_BASE"),
-        os.environ.get(f"TOOL_STAR_{role_key}_API_BASE"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_BASES"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_BASES"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_BASES"),
-        os.environ.get("TOOL_STAR_AUX_API_BASES"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_API_BASE"),
-        os.environ.get("TOOL_STAR_AUX_API_BASE"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_BASES"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_API_BASES"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_API_BASE"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_BASES"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_API_BASE"),
+        os.environ.get("RETOOL_VIDEO_AUX_API_BASE"),
         _settings_role_mapping_value("non_planner_role_api_bases", model_role),
         getattr(settings, "non_planner_api_base", ""),
     ))
@@ -3583,12 +3583,12 @@ def _visual_service_base(model_role: str) -> str:
 def _visual_service_model(model_role: str) -> str:
     role_key = _visual_role_env_key(model_role)
     return _first_nonempty(
-        os.environ.get(f"TOOL_STAR_{role_key}_SERVICE_MODEL"),
-        os.environ.get(f"TOOL_STAR_{role_key}_MODEL"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_SERVICE_MODEL"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_MODEL"),
-        os.environ.get("TOOL_STAR_AUX_SERVICE_MODEL"),
-        os.environ.get("TOOL_STAR_AUX_MODEL"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_SERVICE_MODEL"),
+        os.environ.get(f"RETOOL_VIDEO_{role_key}_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_SERVICE_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_MODEL"),
+        os.environ.get("RETOOL_VIDEO_AUX_SERVICE_MODEL"),
+        os.environ.get("RETOOL_VIDEO_AUX_MODEL"),
         _settings_role_mapping_value("non_planner_role_models", model_role),
         getattr(settings, "non_planner_model", ""),
         _default_visual_service_model(model_role),
@@ -3598,9 +3598,9 @@ def _visual_service_model(model_role: str) -> str:
 def _visual_service_enabled(model_role: str) -> bool:
     if _runtime_profile_forces_local_visual_runtime():
         logger.info(
-            "Visual sidecar runtime disabled for role=%s because TOOL_STAR_RUNTIME_PROFILE=%s forces local evaluation runtime.",
+            "Visual sidecar runtime disabled for role=%s because RETOOL_VIDEO_RUNTIME_PROFILE=%s forces local evaluation runtime.",
             str(model_role or "").strip().lower(),
-            str(os.environ.get("TOOL_STAR_RUNTIME_PROFILE", "") or "").strip(),
+            str(os.environ.get("RETOOL_VIDEO_RUNTIME_PROFILE", "") or "").strip(),
         )
         return False
     provider = _visual_service_provider(model_role)
@@ -3701,9 +3701,9 @@ class ServiceVisualProcessor(VisualProcessor):
         min_pixels = _MIN_FRAME_EDGE * _MIN_FRAME_EDGE
         configured_max_frames = int(getattr(settings, "visual_service_max_frames", 1) or 1)
         configured_max_pixels = int(getattr(settings, "visual_service_max_pixels", 336 * 336) or (336 * 336))
-        max_frames = self._env_positive_int("TOOL_STAR_VISUAL_SERVICE_MAX_FRAMES", configured_max_frames)
+        max_frames = self._env_positive_int("RETOOL_VIDEO_VISUAL_SERVICE_MAX_FRAMES", configured_max_frames)
         max_pixels = self._env_positive_int(
-            "TOOL_STAR_VISUAL_SERVICE_MAX_PIXELS",
+            "RETOOL_VIDEO_VISUAL_SERVICE_MAX_PIXELS",
             min(global_max_pixels, max(min_pixels, configured_max_pixels)),
         )
         return max_frames, max(min_pixels, min(global_max_pixels, max_pixels))
@@ -3814,7 +3814,7 @@ class VLLMVisualProcessor(ServiceVisualProcessor):
 
     def _caption_concurrency(self) -> int:
         try:
-            return max(1, int(os.environ.get("TOOLSTAR_CAPTION_CONCURRENCY", "8") or 8))
+            return max(1, int(os.environ.get("RETOOL_VIDEO_CAPTION_CONCURRENCY", "8") or 8))
         except ValueError:
             return 8
 

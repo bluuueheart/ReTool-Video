@@ -129,7 +129,7 @@ def embeddings_api_marked_unhealthy(base_url: str) -> bool:
 
 def _configured_policy() -> str:
     return str(
-        os.environ.get("TOOL_STAR_SIDECAR_LOAD_BALANCE_POLICY", "")
+        os.environ.get("RETOOL_VIDEO_SIDECAR_LOAD_BALANCE_POLICY", "")
         or getattr(settings, "sidecar_load_balance_policy", "least_inflight")
         or "least_inflight"
     ).strip().lower()
@@ -140,7 +140,7 @@ def _failure_cooldown_seconds() -> float:
         return max(
             0.0,
             float(
-                os.environ.get("TOOL_STAR_SIDECAR_ENDPOINT_FAILURE_COOLDOWN_SECONDS", "")
+                os.environ.get("RETOOL_VIDEO_SIDECAR_ENDPOINT_FAILURE_COOLDOWN_SECONDS", "")
                 or getattr(settings, "sidecar_endpoint_failure_cooldown_seconds", 20.0)
                 or 0.0
             ),

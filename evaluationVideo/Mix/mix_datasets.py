@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from mvbench_metadata import DEFAULT_MVBENCH_TASK_SPECS, build_question_block as build_mvbench_question_block, render_prompt as render_mvbench_prompt
 
 
-MLVU_DEV_TASK_SPECS: Tuple[Tuple[str, str, str], ...] = (
+MLVU_MULTIPLE_CHOICE_TASKS: Tuple[Tuple[str, str, str], ...] = (
     ("count", "4_count.json", "4_count"),
     ("ego", "3_ego.json", "3_ego"),
     ("needle", "2_needle.json", "2_needle"),
@@ -373,10 +373,10 @@ def load_mlvu_inventory(
     )
     prompt_template = load_text(prompt_template_path)
 
-    ordered_subset_names = [task_type for task_type, _, _ in MLVU_DEV_TASK_SPECS]
+    ordered_subset_names = [task_type for task_type, _, _ in MLVU_MULTIPLE_CHOICE_TASKS]
     samples_by_subset: Dict[str, List[MixSample]] = {name: [] for name in ordered_subset_names}
 
-    for task_type, json_file, canonical_video_subdir in MLVU_DEV_TASK_SPECS:
+    for task_type, json_file, canonical_video_subdir in MLVU_MULTIPLE_CHOICE_TASKS:
         json_path = annotation_root / json_file
         video_subdir = _resolve_mlvu_video_subdir(video_root, canonical_video_subdir, task_type)
         with open(json_path, "r", encoding="utf-8") as handle:

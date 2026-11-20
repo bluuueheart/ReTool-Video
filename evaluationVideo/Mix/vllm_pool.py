@@ -35,8 +35,8 @@ from typing import Any, Dict, List, Optional, Sequence
 LOGGER = logging.getLogger("vllm_pool")
 
 GIB = 1024.0
-DEFAULT_ROOT = Path(os.environ.get("TOOLSTAR_VLLM_POOL_ROOT") or (Path(__file__).resolve().parents[2] / "local_runs" / "vllm_pool"))
-DEFAULT_MODEL = os.environ.get("TOOLSTAR_VLLM_MODEL_PATH") or str(Path(os.environ.get("MODEL_BASE_PATH", "./models")) / "Qwen/Qwen3.5-9B")
+DEFAULT_ROOT = Path(os.environ.get("RETOOL_VIDEO_VLLM_POOL_ROOT") or (Path(__file__).resolve().parents[2] / "local_runs" / "vllm_pool"))
+DEFAULT_MODEL = os.environ.get("RETOOL_VIDEO_VLLM_MODEL_PATH") or str(Path(os.environ.get("MODEL_BASE_PATH", "./models")) / "Qwen/Qwen3.5-9B")
 # Cap on client workers per GPU. The environment can request a lower cap.
 HARD_MAX_WORKERS_PER_GPU = 6
 TOKENS_PER_KV_GIB = 8000  # measured on Qwen3.5-9B (hybrid attention): 36.75 GiB -> 300k tokens
@@ -91,7 +91,7 @@ class PlanParams:
             ("max_workers_per_gpu", int), ("max_total_workers", int),
             ("max_model_len_cap", int), ("max_num_seqs", int),
         ):
-            raw = os.environ.get(f"TOOLSTAR_VLLM_{key.upper()}")
+            raw = os.environ.get(f"RETOOL_VIDEO_VLLM_{key.upper()}")
             if raw not in (None, ""):
                 setattr(p, key, caster(raw))
         p.max_workers_per_gpu = max(1, min(int(p.max_workers_per_gpu), HARD_MAX_WORKERS_PER_GPU))
@@ -172,7 +172,7 @@ def plan_path(root: Path = DEFAULT_ROOT) -> Path:
 
 
 def load_plan(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    path = Path(path or os.environ.get("TOOLSTAR_VLLM_PLAN") or plan_path())
+    path = Path(path or os.environ.get("RETOOL_VIDEO_VLLM_PLAN") or plan_path())
     try:
         return json.loads(path.read_text())
     except Exception:
@@ -207,12 +207,12 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
     env["CUDA_VISIBLE_DEVICES"] = rep.device
     if "VLLM_CACHE_ROOT" not in env and env.get("XDG_CACHE_HOME"):
         env["VLLM_CACHE_ROOT"] = str(Path(env["XDG_CACHE_HOME"]) / "vllm")
-    vllm_bin_dir = os.environ.get("TOOLSTAR_VLLM_BIN")
+    vllm_bin_dir = os.environ.get("RETOOL_VIDEO_VLLM_BIN")
     if vllm_bin_dir:
         env["PATH"] = str(Path(vllm_bin_dir).expanduser().resolve()) + os.pathsep + env.get("PATH", "")
     executable = shutil.which("vllm", path=env.get("PATH"))
     if executable is None:
-        raise RuntimeError("vLLM executable not found. Install vLLM or set TOOLSTAR_VLLM_BIN.")
+        raise RuntimeError("vLLM executable not found. Install vLLM or set RETOOL_VIDEO_VLLM_BIN.")
     cmd = [
         executable, "serve", model,
         "--served-model-name", served, "--host", "127.0.0.1", "--port", str(rep.port),
@@ -221,7 +221,7 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
         "--kv-cache-memory-bytes", str(int(rep.kv_gib * 1024 ** 3)),
         "--max-num-seqs", str(PlanParams.from_env().max_num_seqs),
         "--limit-mm-per-prompt", json.dumps({"image": 64, "video": 4}),
-        "--allowed-local-media-path", os.environ.get("TOOLSTAR_VLLM_MEDIA_ROOT", str(Path.cwd())),
+        "--allowed-local-media-path", os.environ.get("RETOOL_VIDEO_VLLM_MEDIA_ROOT", str(Path.cwd())),
         "--default-chat-template-kwargs", json.dumps({"enable_thinking": False}),
         # Model card: with num_frames=-1 the request's mm_processor_kwargs (fps, do_sample_frames) decide the sampling.
         "--media-io-kwargs", json.dumps({"video": {"num_frames": -1}}),
@@ -229,17 +229,17 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
         # engine cache misses (vLLM 0.19 AssertionError); preprocessing cost is small.
         "--mm-processor-cache-gb", "0",
     ]
-    if os.environ.get("TOOLSTAR_VLLM_REASONING_PARSER", "1") != "0":
+    if os.environ.get("RETOOL_VIDEO_VLLM_REASONING_PARSER", "1") != "0":
         # Thinking-mode replies: reasoning goes to a separate field, `content` keeps the answer only.
         cmd += ["--reasoning-parser", "qwen3"]
-    if os.environ.get("TOOLSTAR_VLLM_PREFIX_CACHING", "1") != "0":
+    if os.environ.get("RETOOL_VIDEO_VLLM_PREFIX_CACHING", "1") != "0":
         # Planner turns reuse the conversation prefix.
         cmd.append("--enable-prefix-caching")
-    lora = str(os.environ.get("TOOLSTAR_VLLM_LORA_MODULES", "") or "").strip()
+    lora = str(os.environ.get("RETOOL_VIDEO_VLLM_LORA_MODULES", "") or "").strip()
     if lora:
         # "name=/path/to/adapter[,name2=path2]": adapters are served next to the base model (request model=name picks one,
         # model=<served name> is the untouched base). Unset keeps the old command line.
-        cmd += ["--enable-lora", "--max-lora-rank", os.environ.get("TOOLSTAR_VLLM_MAX_LORA_RANK", "64"), "--max-loras", "1",
+        cmd += ["--enable-lora", "--max-lora-rank", os.environ.get("RETOOL_VIDEO_VLLM_MAX_LORA_RANK", "64"), "--max-loras", "1",
                 "--lora-modules", *lora.split(",")]
     with log.open("ab") as handle:
         proc = subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
@@ -435,7 +435,7 @@ def expand_workers(plan: Dict[str, Any], limit: Optional[int] = None) -> List[st
         card = [str(rep["device"])] * max(0, min(int(rep["workers"]), HARD_MAX_WORKERS_PER_GPU))
         per_card.append(card)
         slots.extend(card)
-    if os.environ.get("TOOLSTAR_VLLM_SPREAD_WORKERS") == "1":
+    if os.environ.get("RETOOL_VIDEO_VLLM_SPREAD_WORKERS") == "1":
         # Cards are already up (shared pool): hand slots out round-robin so a small batch uses every card.
         slots = [card[i] for i in range(max((len(c) for c in per_card), default=0)) for card in per_card if i < len(card)]
     return slots[:limit] if limit else slots
@@ -454,7 +454,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("plan", "up", "status", "down"))
-    parser.add_argument("--devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("TOOLSTAR_ALLOWED_GPUS")))
+    parser.add_argument("--devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("RETOOL_VIDEO_ALLOWED_GPUS")))
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     args = parser.parse_args()
     if args.command in {"plan", "up"}:

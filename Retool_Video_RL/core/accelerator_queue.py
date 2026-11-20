@@ -40,7 +40,7 @@ def _sanitize_lock_component(value: Any, *, fallback: str) -> str:
 
 
 def resolve_shared_accelerator_queue_root(configured_root: Any = None) -> Path:
-    raw_value = str(configured_root or os.environ.get("TOOL_STAR_SHARED_ACCELERATOR_QUEUE_ROOT") or "").strip()
+    raw_value = str(configured_root or os.environ.get("RETOOL_VIDEO_SHARED_ACCELERATOR_QUEUE_ROOT") or "").strip()
     if raw_value:
         path = Path(raw_value).expanduser()
         if not path.is_absolute():

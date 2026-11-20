@@ -14,7 +14,6 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import struct
 import sys
 import time
@@ -136,20 +135,20 @@ def _normalize_runtime_profile(value: Any) -> str:
 
 def _evaluation_local_runtime_env_overrides() -> tuple[Dict[str, str], List[str]]:
     overrides = {
-        "TOOL_STAR_RUNTIME_PROFILE": _PIPELINE_RUNTIME_PROFILE_EVALUATION_LOCAL,
-        "TOOL_STAR_DISABLE_E2E_SIDECAR_AUTOSTART": "1",
-        "TOOL_STAR_ENABLE_NON_PLANNER_SIDECARS": "0",
-        "TOOL_STAR_NON_PLANNER_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_AUX_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_SUBAGENT_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_SUBAGENT_SERVICE_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_PREPROCESS_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_QWEN_VL_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_OCR_MODEL_PROVIDER": "transformers",
-        "TOOL_STAR_NON_PLANNER_EMBEDDING_PROVIDER": "local",
-        "TOOL_STAR_TOOL_SEARCH_EMBEDDING_PROVIDER": "local",
-        "TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_PROVIDER": "local",
-        "TOOL_STAR_PREPROCESS_EMBEDDING_PROVIDER": "local",
+        "RETOOL_VIDEO_RUNTIME_PROFILE": _PIPELINE_RUNTIME_PROFILE_EVALUATION_LOCAL,
+        "RETOOL_VIDEO_DISABLE_E2E_SIDECAR_AUTOSTART": "1",
+        "RETOOL_VIDEO_ENABLE_NON_PLANNER_SIDECARS": "0",
+        "RETOOL_VIDEO_NON_PLANNER_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_AUX_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_SUBAGENT_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_SUBAGENT_SERVICE_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_PREPROCESS_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_QWEN_VL_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_OCR_MODEL_PROVIDER": "transformers",
+        "RETOOL_VIDEO_NON_PLANNER_EMBEDDING_PROVIDER": "local",
+        "RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_PROVIDER": "local",
+        "RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_PROVIDER": "local",
+        "RETOOL_VIDEO_PREPROCESS_EMBEDDING_PROVIDER": "local",
     }
     clear_keys: List[str] = []
     for prefix in (
@@ -162,7 +161,7 @@ def _evaluation_local_runtime_env_overrides() -> tuple[Dict[str, str], List[str]
         "OCR",
     ):
         for suffix in ("API_BASES", "API_BASE", "SERVICE_API_BASES", "SERVICE_API_BASE"):
-            clear_keys.append(f"TOOL_STAR_{prefix}_{suffix}")
+            clear_keys.append(f"RETOOL_VIDEO_{prefix}_{suffix}")
     for prefix in (
         "NON_PLANNER_EMBEDDING",
         "TOOL_SEARCH_EMBEDDING",
@@ -170,7 +169,7 @@ def _evaluation_local_runtime_env_overrides() -> tuple[Dict[str, str], List[str]
         "PREPROCESS_EMBEDDING",
     ):
         for suffix in ("API_BASES", "API_BASE"):
-            clear_keys.append(f"TOOL_STAR_{prefix}_{suffix}")
+            clear_keys.append(f"RETOOL_VIDEO_{prefix}_{suffix}")
     clear_keys.extend(
         [
             "RANK",
@@ -468,13 +467,13 @@ def _endpoint_list_supports_multimodal_chat_smoke(raw_endpoints: str, api_key: s
 
 def _should_prepare_non_planner_sidecars_for_e2e() -> bool:
     provider = (
-        os.environ.get("TOOL_STAR_NON_PLANNER_MODEL_PROVIDER")
-        or os.environ.get("TOOL_STAR_AUX_MODEL_PROVIDER")
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_MODEL_PROVIDER")
+        or os.environ.get("RETOOL_VIDEO_AUX_MODEL_PROVIDER")
         or getattr(settings, "non_planner_model_provider", "auto")
     )
     if not _provider_requests_service(provider):
         return False
-    if str(os.environ.get("TOOL_STAR_DISABLE_E2E_SIDECAR_AUTOSTART", "")).strip() == "1":
+    if str(os.environ.get("RETOOL_VIDEO_DISABLE_E2E_SIDECAR_AUTOSTART", "")).strip() == "1":
         return False
     if any(os.environ.get(key) for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
         return False
@@ -488,18 +487,18 @@ def _ensure_non_planner_runtime_ready_for_e2e() -> None:
     project_root = Path(__file__).resolve().parent
     env_file = Path(
         os.environ.get(
-            "TOOL_STAR_SIDECAR_ENV_FILE",
+            "RETOOL_VIDEO_SIDECAR_ENV_FILE",
             str(project_root / "rl_workdir" / "sidecars" / "env.sh"),
         )
     ).resolve()
-    api_key = str(os.environ.get("TOOL_STAR_SIDECAR_API_KEY", "EMPTY") or "EMPTY").strip()
+    api_key = str(os.environ.get("RETOOL_VIDEO_SIDECAR_API_KEY", "EMPTY") or "EMPTY").strip()
 
     loaded_env = _load_sidecar_runtime_env(env_file) if env_file.exists() else {}
     endpoint_env = (
-        loaded_env.get("TOOL_STAR_NON_PLANNER_API_BASES")
-        or loaded_env.get("TOOL_STAR_NON_PLANNER_API_BASE")
-        or os.environ.get("TOOL_STAR_NON_PLANNER_API_BASES")
-        or os.environ.get("TOOL_STAR_NON_PLANNER_API_BASE")
+        loaded_env.get("RETOOL_VIDEO_NON_PLANNER_API_BASES")
+        or loaded_env.get("RETOOL_VIDEO_NON_PLANNER_API_BASE")
+        or os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASES")
+        or os.environ.get("RETOOL_VIDEO_NON_PLANNER_API_BASE")
     )
     normalized_endpoints = format_endpoint_list(str(endpoint_env or ""))
     if normalized_endpoints in _NON_PLANNER_RUNTIME_READY_SIGNATURES:
@@ -515,43 +514,8 @@ def _ensure_non_planner_runtime_ready_for_e2e() -> None:
         _NON_PLANNER_RUNTIME_READY_SIGNATURES.add(normalized_endpoints)
         return
 
-    start_script = project_root / "scripts" / "start_non_planner_sidecars.sh"
-    if not start_script.exists():
-        logger.warning(
-            "Non-planner sidecar autostart skipped because script is missing: %s",
-            start_script,
-        )
-        return
-
-    logger.info(
-        "Non-planner sidecar endpoints are missing or unhealthy for e2e run; starting managed sidecars via %s",
-        start_script,
-    )
-    start_env = os.environ.copy()
-    start_env["TOOL_STAR_ENABLE_NON_PLANNER_SIDECARS"] = "1"
-    subprocess.run(
-        ["sh", str(start_script)],
-        cwd=str(project_root),
-        env=start_env,
-        check=True,
-    )
-    loaded_env = _load_sidecar_runtime_env(env_file)
-    endpoint_env = (
-        loaded_env.get("TOOL_STAR_NON_PLANNER_API_BASES")
-        or loaded_env.get("TOOL_STAR_NON_PLANNER_API_BASE")
-        or os.environ.get("TOOL_STAR_NON_PLANNER_API_BASES")
-        or os.environ.get("TOOL_STAR_NON_PLANNER_API_BASE")
-    )
-    normalized_endpoints = format_endpoint_list(str(endpoint_env or ""))
-    if not (
-        _endpoint_list_is_healthy(normalized_endpoints, api_key)
-        and _endpoint_list_supports_multimodal_chat_smoke(normalized_endpoints, api_key)
-    ):
-        raise RuntimeError(
-            f"Managed non-planner sidecar startup completed but endpoints are still unhealthy: {endpoint_env or '<empty>'}"
-        )
-    _NON_PLANNER_RUNTIME_READY_SIGNATURES.add(normalized_endpoints)
-    logger.info("Managed non-planner sidecars are ready for this e2e run: %s", endpoint_env)
+    if normalized_endpoints:
+        logger.warning("Configured non-planner endpoints are unavailable: %s", normalized_endpoints)
 
 
 def _get_preprocessing_module_exports():
@@ -997,10 +961,10 @@ def _resolve_grounding_embedding_provider(provider: Optional[str] = None) -> str
 def _grounding_embedding_service_base() -> str:
     return format_endpoint_list(
         str(
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASES", "")
-            or os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASE", "")
-            or os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_API_BASES", "")
-            or os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_API_BASE", "")
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASES", "")
+            or os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASE", "")
+            or os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_API_BASES", "")
+            or os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_API_BASE", "")
             or getattr(settings, "planner_grounding_embedding_api_base", "")
             or getattr(settings, "non_planner_embedding_api_base", "")
             or ""
@@ -1010,7 +974,7 @@ def _grounding_embedding_service_base() -> str:
 
 def _grounding_embedding_service_key() -> str:
     return str(
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_KEY", "")
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_KEY", "")
         or getattr(settings, "planner_grounding_embedding_api_key", "")
         or getattr(settings, "non_planner_embedding_api_key", "")
         or settings.openai_api_key
@@ -1020,7 +984,7 @@ def _grounding_embedding_service_key() -> str:
 
 def _grounding_embedding_service_model() -> str:
     return str(
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_MODEL", "")
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_MODEL", "")
         or getattr(settings, "planner_grounding_embedding_model", "")
         or getattr(settings, "non_planner_embedding_model", "")
         or getattr(settings, "qwen3_vl_embedding_model_path", "")

@@ -227,7 +227,7 @@ class PipelineConfig:
     whisper_cpu_threads: int = field(default_factory=lambda: max(1, int(settings.asr_cpu_threads)))
     asr_device: Optional[str] = field(
         default_factory=lambda: str(
-            os.environ.get("TOOLSTAR_ASR_DEVICE") or settings.preprocess_asr_device or "cpu"
+            os.environ.get("RETOOL_VIDEO_ASR_DEVICE") or settings.preprocess_asr_device or "cpu"
         )
     )
     
@@ -471,7 +471,7 @@ class VideoPreprocessingPipeline:
             )
 
         # Release GPU Whisper once transcripts exist. Reusable workers may retain it.
-        if str(os.environ.get("TOOLSTAR_PERSIST_ASR_RUNTIME", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+        if str(os.environ.get("RETOOL_VIDEO_PERSIST_ASR_RUNTIME", "")).strip().lower() not in {"1", "true", "yes", "on"}:
             self.asr_processor.unload_model()
 
         # Step 3: Generate captions

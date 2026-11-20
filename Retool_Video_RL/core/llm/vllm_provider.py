@@ -4,7 +4,7 @@ Drop-in replacement for the in-process ``TransformersProvider`` that talks to
 one or more local vLLM OpenAI-compatible servers (continuous batching, prefix
 cache, multi-GPU replicas selected by least in-flight requests).
 
-Enable with ``TOOLSTAR_LLM_BACKEND=vllm`` and ``TOOLSTAR_VLLM_BASE_URLS``
+Enable with ``RETOOL_VIDEO_LLM_BACKEND=vllm`` and ``RETOOL_VIDEO_VLLM_BASE_URLS``
 (comma separated ``http://host:port/v1``).  The routing hook lives in
 ``provider.get_llm_provider``; the replica pool is started by
 ``evaluationVideo/Mix/vllm_pool.py``.
@@ -40,21 +40,21 @@ _PROMPT_RE = re.compile(r"(\d+)\s+(?:tokens\s+)?in the messages", re.IGNORECASE)
 
 def vllm_backend_enabled() -> bool:
     return (
-        str(os.environ.get("TOOLSTAR_LLM_BACKEND", "")).strip().lower() == "vllm"
+        str(os.environ.get("RETOOL_VIDEO_LLM_BACKEND", "")).strip().lower() == "vllm"
         and bool(vllm_base_urls())
     )
 
 
 def vllm_base_urls() -> str:
-    return str(os.environ.get("TOOLSTAR_VLLM_BASE_URLS", "") or "").strip()
+    return str(os.environ.get("RETOOL_VIDEO_VLLM_BASE_URLS", "") or "").strip()
 
 
 def vllm_served_model_name() -> str:
-    return str(os.environ.get("TOOLSTAR_VLLM_MODEL", "") or "qwen35-9b").strip()
+    return str(os.environ.get("RETOOL_VIDEO_VLLM_MODEL", "") or "qwen35-9b").strip()
 
 
 def _media_root() -> Path:
-    return Path(os.environ.get("TOOLSTAR_VLLM_MEDIA_ROOT", str(Path.cwd()))).resolve()
+    return Path(os.environ.get("RETOOL_VIDEO_VLLM_MEDIA_ROOT", str(Path.cwd()))).resolve()
 
 
 def _jpeg_b64(image: Image.Image, *, max_pixels: Optional[int] = None, quality: int = 92) -> str:
@@ -120,7 +120,7 @@ def vllm_serves_model(model_name: Any) -> bool:
     """True when ``model_name`` is the checkpoint served by the vLLM replicas."""
     if not vllm_backend_enabled() or not model_name:
         return False
-    served = os.environ.get("TOOLSTAR_VLLM_MODEL_PATH") or getattr(settings, "planner_model_path", "")
+    served = os.environ.get("RETOOL_VIDEO_VLLM_MODEL_PATH") or getattr(settings, "planner_model_path", "")
     try:
         return Path(str(model_name)).expanduser().resolve() == Path(str(served)).expanduser().resolve()
     except Exception:
@@ -188,7 +188,7 @@ class VLLMProvider(OpenAIProvider):
         provider that was built as "planner" for clip QA / whole-video view; those must stay on the base model, so the planner
         adapter is chosen here and not when the provider is constructed."""
         role = str(getattr(self, "model_role", "") or "").strip().lower()
-        key = {"planner": "TOOLSTAR_VLLM_PLANNER_MODEL", "subagent": "TOOLSTAR_VLLM_RESOLVER_MODEL"}.get(role)
+        key = {"planner": "RETOOL_VIDEO_VLLM_PLANNER_MODEL", "subagent": "RETOOL_VIDEO_VLLM_RESOLVER_MODEL"}.get(role)
         override = str(os.environ.get(key, "") or "").strip() if key else ""
         if override:
             return override
@@ -328,7 +328,7 @@ class VLLMProvider(OpenAIProvider):
         which killed long agent runs whose history kept accumulating frames. Older images are
         replaced by a short text marker so message structure and ordering stay intact.
         """
-        limit = _positive_int(os.environ.get("TOOLSTAR_VLLM_MAX_IMAGES")) or 60
+        limit = _positive_int(os.environ.get("RETOOL_VIDEO_VLLM_MAX_IMAGES")) or 60
         slots = [
             (mi, pi)
             for mi, message in enumerate(converted)
@@ -347,7 +347,7 @@ class VLLMProvider(OpenAIProvider):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            path = self.local_model_path or os.environ.get("TOOLSTAR_VLLM_MODEL_PATH") or settings.planner_model_path
+            path = self.local_model_path or os.environ.get("RETOOL_VIDEO_VLLM_MODEL_PATH") or settings.planner_model_path
             self._tokenizer = AutoTokenizer.from_pretrained(str(path), trust_remote_code=True)
         return self._tokenizer
 
@@ -488,8 +488,8 @@ class VLLMProvider(OpenAIProvider):
         if presence is not None:
             payload["presence_penalty"] = presence
         payload.update(kw)
-        if "seed" not in payload and os.environ.get("TOOLSTAR_VLLM_REQUEST_SEED"):
-            payload["seed"] = int(os.environ["TOOLSTAR_VLLM_REQUEST_SEED"])
+        if "seed" not in payload and os.environ.get("RETOOL_VIDEO_VLLM_REQUEST_SEED"):
+            payload["seed"] = int(os.environ["RETOOL_VIDEO_VLLM_REQUEST_SEED"])
         return payload
 
     def generate(self, messages, temperature=None, max_tokens=None, **kwargs) -> str:

@@ -174,7 +174,7 @@ except Exception as exc:  # pragma: no cover - import depends on target runtime
     ) from exc
 
 
-class _ToolStarQwen3VLForEmbedding(Qwen3VLPreTrainedModel):
+class _ReToolVideoQwen3VLForEmbedding(Qwen3VLPreTrainedModel):
     _checkpoint_conversion_mapping = {}
     accepts_loss_kwargs = False
 
@@ -416,7 +416,7 @@ class Qwen3VLEmbeddingRuntimeEncoder:
                 cache_dir=str(resolved_model_path),
                 padding_side="right",
             )
-            model = _ToolStarQwen3VLForEmbedding.from_pretrained(
+            model = _ReToolVideoQwen3VLForEmbedding.from_pretrained(
                 str(resolved_model_path),
                 trust_remote_code=True,
                 local_files_only=True,

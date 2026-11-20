@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     tool_search_embedding_sidecar_replica_count: int = 1
     grounding_embedding_sidecar_replica_count: int = 1
     # Optional per-role overrides. Edit these in config instead of exporting
-    # TOOL_STAR_* variables for every run.
+    # RETOOL_VIDEO_* variables for every run.
     non_planner_role_providers: Dict[str, str] = {}
     non_planner_role_api_keys: Dict[str, str] = {}
     non_planner_role_api_bases: Dict[str, str] = {}

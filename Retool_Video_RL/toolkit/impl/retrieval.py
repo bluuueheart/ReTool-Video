@@ -1672,10 +1672,10 @@ def _settings_embedding_mapping_value(mapping_name: str, role: str = "tool_searc
 def _tool_search_embedding_provider() -> str:
     return _normalize_embedding_provider_name(
         _first_nonempty(
-            os.environ.get("TOOL_STAR_TOOL_SEARCH_EMBEDDING_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_PROVIDER"),
             _settings_embedding_mapping_value("non_planner_embedding_role_providers"),
             getattr(settings, "non_planner_embedding_provider", "auto"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_PROVIDER"),
         )
     )
 
@@ -1683,12 +1683,12 @@ def _tool_search_embedding_provider() -> str:
 def _tool_search_embedding_service_base() -> str:
     return format_endpoint_list(
         _first_nonempty(
-            os.environ.get("TOOL_STAR_TOOL_SEARCH_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_TOOL_SEARCH_EMBEDDING_API_BASE"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_BASE"),
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASE"),
             _settings_embedding_mapping_value("non_planner_embedding_role_api_bases"),
             getattr(settings, "non_planner_embedding_api_base", ""),
             getattr(settings, "planner_grounding_embedding_api_base", ""),
@@ -1698,11 +1698,11 @@ def _tool_search_embedding_service_base() -> str:
 
 def _tool_search_embedding_service_key() -> str:
     return _first_nonempty(
-        os.environ.get("TOOL_STAR_TOOL_SEARCH_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_API_KEY"),
         _settings_embedding_mapping_value("non_planner_embedding_role_api_keys"),
         getattr(settings, "non_planner_embedding_api_key", ""),
-        os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_KEY"),
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_KEY"),
         getattr(settings, "planner_grounding_embedding_api_key", ""),
         getattr(settings, "openai_api_key", ""),
         "EMPTY",
@@ -1711,12 +1711,12 @@ def _tool_search_embedding_service_key() -> str:
 
 def _tool_search_embedding_service_model() -> str:
     return _first_nonempty(
-        os.environ.get("TOOL_STAR_TOOL_SEARCH_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_MODEL"),
         _settings_embedding_mapping_value("non_planner_embedding_role_models"),
         getattr(settings, "non_planner_embedding_model", ""),
         getattr(settings, "embedding_model_path", ""),
-        os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_MODEL"),
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_MODEL"),
         getattr(settings, "planner_grounding_embedding_model", ""),
     )
 
@@ -1747,13 +1747,13 @@ class _ToolSearchEmbedder:
         if self._service_enabled:
             if not self._service_base:
                 raise RuntimeError(
-                    "Tool_Search embedding service requires TOOL_STAR_TOOL_SEARCH_EMBEDDING_API_BASE "
-                    "or TOOL_STAR_NON_PLANNER_EMBEDDING_API_BASE."
+                    "Tool_Search embedding service requires RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_API_BASE "
+                    "or RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_BASE."
                 )
             if not self._service_model:
                 raise RuntimeError(
-                    "Tool_Search embedding service requires TOOL_STAR_TOOL_SEARCH_EMBEDDING_MODEL "
-                    "or TOOL_STAR_NON_PLANNER_EMBEDDING_MODEL."
+                    "Tool_Search embedding service requires RETOOL_VIDEO_TOOL_SEARCH_EMBEDDING_MODEL "
+                    "or RETOOL_VIDEO_NON_PLANNER_EMBEDDING_MODEL."
                 )
             self._device_type = "service"
             self._accelerator_count = 0

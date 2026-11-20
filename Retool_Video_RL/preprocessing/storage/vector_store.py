@@ -180,9 +180,9 @@ def _preprocess_embedding_service_provider() -> str:
         _first_nonempty(
             _settings_embedding_mapping_value("non_planner_embedding_role_providers"),
             getattr(settings, "non_planner_embedding_provider", "auto"),
-            os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_PROVIDER"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_PROVIDER"),
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_PROVIDER"),
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_PROVIDER"),
             getattr(settings, "planner_grounding_embedding_provider", "auto"),
         )
     )
@@ -191,12 +191,12 @@ def _preprocess_embedding_service_provider() -> str:
 def _preprocess_embedding_service_base() -> str:
     return format_endpoint_list(
         _first_nonempty(
-            os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_API_BASE"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_BASE"),
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASES"),
-            os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_BASE"),
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASES"),
+            os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_BASE"),
             _settings_embedding_mapping_value("non_planner_embedding_role_api_bases"),
             getattr(settings, "non_planner_embedding_api_base", ""),
             getattr(settings, "planner_grounding_embedding_api_base", ""),
@@ -208,9 +208,9 @@ def _preprocess_embedding_service_key() -> str:
     return _first_nonempty(
         _settings_embedding_mapping_value("non_planner_embedding_role_api_keys"),
         getattr(settings, "non_planner_embedding_api_key", ""),
-        os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_API_KEY"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_API_KEY"),
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_API_KEY"),
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_API_KEY"),
         getattr(settings, "planner_grounding_embedding_api_key", ""),
         getattr(settings, "openai_api_key", ""),
         "EMPTY",
@@ -222,9 +222,9 @@ def _preprocess_embedding_service_model() -> str:
         _settings_embedding_mapping_value("non_planner_embedding_role_models"),
         getattr(settings, "non_planner_embedding_model", ""),
         getattr(settings, "qwen3_vl_embedding_model_path", ""),
-        os.environ.get("TOOL_STAR_PREPROCESS_EMBEDDING_MODEL"),
-        os.environ.get("TOOL_STAR_NON_PLANNER_EMBEDDING_MODEL"),
-        os.environ.get("TOOL_STAR_ROLLOUT_GROUNDING_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_PREPROCESS_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_NON_PLANNER_EMBEDDING_MODEL"),
+        os.environ.get("RETOOL_VIDEO_ROLLOUT_GROUNDING_EMBEDDING_MODEL"),
         getattr(settings, "planner_grounding_embedding_model", ""),
     )
 

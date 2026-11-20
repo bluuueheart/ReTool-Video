@@ -268,7 +268,7 @@ class ProcessBackedLLMProvider(BaseLLM):
             target=_run_transformers_worker,
             args=(self._provider_kwargs, self._request_queue, self._response_queue),
             daemon=False,
-            name=f"tool_star_llm_{self.model_role or 'default'}",
+            name=f"retool_video_llm_{self.model_role or 'default'}",
         )
         self._process.start()
         logger.info(
@@ -328,7 +328,7 @@ class ProcessBackedLLMProvider(BaseLLM):
             pass
 
     def _request(self, method: str, **payload: Any) -> Any:
-        if method == "generate" and os.environ.get("TOOLSTAR_INFERENCE_METRICS") == "1":
+        if method == "generate" and os.environ.get("RETOOL_VIDEO_INFERENCE_METRICS") == "1":
             from .inference_metrics import current_scope
             payload["inference_metrics_context"] = current_scope()
         with self._lock:

@@ -465,13 +465,13 @@ class ASRProcessor:
             logging.warning("Ignoring invalid %s=%r.", name, raw_value)
             return default
 
-        beam_size = _env_int("TOOLSTAR_ASR_BEAM_SIZE", 1 if self.device == "cpu" else None)
-        best_of = _env_int("TOOLSTAR_ASR_BEST_OF", 1 if self.device == "cpu" else None)
+        beam_size = _env_int("RETOOL_VIDEO_ASR_BEAM_SIZE", 1 if self.device == "cpu" else None)
+        best_of = _env_int("RETOOL_VIDEO_ASR_BEST_OF", 1 if self.device == "cpu" else None)
         condition_on_previous_text = _env_bool(
-            "TOOLSTAR_ASR_CONDITION_ON_PREVIOUS_TEXT",
+            "RETOOL_VIDEO_ASR_CONDITION_ON_PREVIOUS_TEXT",
             False if self.device == "cpu" else None,
         )
-        vad_filter = _env_bool("TOOLSTAR_ASR_VAD_FILTER", None)
+        vad_filter = _env_bool("RETOOL_VIDEO_ASR_VAD_FILTER", None)
         if beam_size is not None:
             transcribe_kwargs["beam_size"] = beam_size
         if best_of is not None:

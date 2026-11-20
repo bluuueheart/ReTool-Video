@@ -23,23 +23,23 @@ pip-wheel-metadata/
 
 # Virtual environments
 .venv/
+/.venv-vllm/
+/.venv-diarization/
 venv/
 env/
 ENV/
 
 # Local generated directories
 /.tmp/
-/tmp_mvbench_main_check/
+/videorag_cache/
 /Retool_Video_RL/videorag_cache/
 /Retool_Video_RL/rl_workdir/
 /evaluationVideo/**/workspaces*/
 /evaluationVideo/**/_shared_cache/
 
-# RL-only code kept outside the upload-focused Mix bundle
-/Retool_Video_RL/src/verl/
-/Retool_Video_RL/scripts/run_video_agent_ppo.sh
-/Retool_Video_RL/scripts/start_non_planner_sidecars.sh
-/Retool_Video_RL/scripts/stop_non_planner_sidecars.sh
+# Local research code and experiment material
+/training/
+/third_party/ms-swift/
 
 # Logs
 *.log

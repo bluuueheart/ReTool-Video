@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 def configure_sample(logs_dir, sample_uid):
-    if os.environ.get('TOOLSTAR_INFERENCE_METRICS') != '1':
+    if os.environ.get('RETOOL_VIDEO_INFERENCE_METRICS') != '1':
         return
-    os.environ['TOOLSTAR_INFERENCE_METRICS_PATH'] = str(Path(logs_dir) / 'inference_metrics.jsonl')
-    os.environ['TOOLSTAR_METRICS_SAMPLE_UID'] = sample_uid
-    os.environ['TOOLSTAR_METRICS_SAMPLE_ATTEMPT'] = uuid.uuid4().hex
+    os.environ['RETOOL_VIDEO_INFERENCE_METRICS_PATH'] = str(Path(logs_dir) / 'inference_metrics.jsonl')
+    os.environ['RETOOL_VIDEO_METRICS_SAMPLE_UID'] = sample_uid
+    os.environ['RETOOL_VIDEO_METRICS_SAMPLE_ATTEMPT'] = uuid.uuid4().hex
     emit(kind='sample_start')
 
 
@@ -39,14 +39,14 @@ def current_scope():
 
 
 def emit(**values):
-    path = os.environ.get('TOOLSTAR_INFERENCE_METRICS_PATH')
-    if os.environ.get('TOOLSTAR_INFERENCE_METRICS') != '1' or not path:
+    path = os.environ.get('RETOOL_VIDEO_INFERENCE_METRICS_PATH')
+    if os.environ.get('RETOOL_VIDEO_INFERENCE_METRICS') != '1' or not path:
         return
     try:
         record = {'timestamp_unix': time.time(), 'pid': os.getpid(),
             'thread': threading.current_thread().name,
-            'sample_uid': os.environ.get('TOOLSTAR_METRICS_SAMPLE_UID'),
-            'sample_attempt_id': os.environ.get('TOOLSTAR_METRICS_SAMPLE_ATTEMPT'),
+            'sample_uid': os.environ.get('RETOOL_VIDEO_METRICS_SAMPLE_UID'),
+            'sample_attempt_id': os.environ.get('RETOOL_VIDEO_METRICS_SAMPLE_ATTEMPT'),
             'visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'), **_scope.get(), **values}
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ def _record_request(*, provider_role, call_id, attempt, attempt_started, generat
 
 
 def record_request(**values):
-    if os.environ.get('TOOLSTAR_INFERENCE_METRICS') != '1':
+    if os.environ.get('RETOOL_VIDEO_INFERENCE_METRICS') != '1':
         return
     try:
         _record_request(**values)

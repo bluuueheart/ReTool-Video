@@ -224,7 +224,7 @@ def export_video_subclip(
                 "logger": None,
             }
             # Optional faster x264 preset for bulk preprocessing (default keeps moviepy's "medium").
-            encode_preset = str(os.environ.get("TOOLSTAR_CLIP_ENCODE_PRESET", "veryfast") or "").strip()
+            encode_preset = str(os.environ.get("RETOOL_VIDEO_CLIP_ENCODE_PRESET", "veryfast") or "").strip()
             if encode_preset:
                 write_kwargs["preset"] = encode_preset
             if target_fps is not None and float(target_fps) > 0:
@@ -300,7 +300,7 @@ def persist_segment_frame_assets(
 
     items = [(str(raw_id), info) for raw_id, info in segment_times_info.items()]
     by_id = dict(items)
-    workers = _asset_workers("TOOLSTAR_FRAME_EXPORT_WORKERS", 16, len(items))
+    workers = _asset_workers("RETOOL_VIDEO_FRAME_EXPORT_WORKERS", 16, len(items))
     # Contiguous groups keep each reader seeking forward through its own part of the video.
     size = -(-len(items) // workers)
     jobs = [
@@ -354,7 +354,7 @@ def persist_segment_video_assets(
         end = max(start, float(timestamp[1] or start))
         jobs.append((video_path, seg_id, start, end, str(clips_root / _clip_filename(seg_id))))
 
-    workers = _asset_workers("TOOLSTAR_CLIP_EXPORT_WORKERS", 32, len(jobs))
+    workers = _asset_workers("RETOOL_VIDEO_CLIP_EXPORT_WORKERS", 32, len(jobs))
     run_parallel(_export_clip, jobs, workers)
 
     for raw_segment_id, info in segment_times_info.items():
@@ -365,8 +365,8 @@ def persist_segment_video_assets(
 
 
 def lazy_segment_clips_enabled() -> bool:
-    """Segment mp4s are exported on first use (``ensure_segment_clip``) unless TOOLSTAR_LAZY_SEGMENT_CLIPS=0."""
-    return str(os.environ.get("TOOLSTAR_LAZY_SEGMENT_CLIPS", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    """Segment mp4s are exported on first use (``ensure_segment_clip``) unless RETOOL_VIDEO_LAZY_SEGMENT_CLIPS=0."""
+    return str(os.environ.get("RETOOL_VIDEO_LAZY_SEGMENT_CLIPS", "1")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def plan_segment_video_assets(
@@ -407,7 +407,7 @@ def ensure_segment_clip(clip_path: str | Path) -> Path | None:
             return None
         start = max(0.0, float(timestamp[0] or 0.0))
         end = max(start, float(timestamp[1] or start))
-        os.environ.setdefault("TOOLSTAR_CLIP_ENCODE_PRESET", "veryfast")
+        os.environ.setdefault("RETOOL_VIDEO_CLIP_ENCODE_PRESET", "veryfast")
         partial = clip.with_name(f"{clip.stem}.partial-{os.getpid()}{clip.suffix}")
         export_video_subclip(video_path=source, start=start, end=end, output_path=partial)
         os.replace(partial, clip)
