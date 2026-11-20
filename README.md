@@ -1,6 +1,6 @@
 # ReTool-Video
 
-[Paper on arXiv](https://arxiv.org/abs/2605.13228)
+<a href="https://arxiv.org/abs/2605.13228"><img src="https://img.shields.io/badge/arXiv-2605.13228-b31b1b" alt="arXiv"></a>
 
 ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release includes the inference pipeline and a Mix evaluator for MVBench, MLVU, and Video-MME.
 
