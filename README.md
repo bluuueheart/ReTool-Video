@@ -1,6 +1,6 @@
 # ReTool-Video
 
-ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release contains the inference pipeline and the Mix evaluator used for the rebuttal-stage evaluation on MVBench, MLVU, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
+ReTool-Video answers questions about videos through a planner, a tool resolver, and video, audio, and retrieval tools. This release includes the inference pipeline and a Mix evaluator for MVBench, MLVU Dev, and Video-MME. The workflow runs with the base Qwen3.5-9B checkpoint. A fresh run computes its opening video observation directly from the input video.
 
 ## Quickstart
 
@@ -27,7 +27,7 @@ Use `hf auth login` for gated checkpoints and datasets. If your CTranslate2 inst
 
 ### Optional vLLM backend
 
-The rebuttal-stage runs used vLLM for the planner, resolver, captioning, and visual QA. Install upstream vLLM in a separate Python environment because its Transformers requirements may differ from the inference client's. Follow [vLLM's GPU installation guide](https://docs.vllm.ai/en/v0.19.0/getting_started/installation/gpu/) and the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B).
+The optional vLLM backend serves the planner, resolver, captioning, and visual QA. Install upstream vLLM in a separate Python environment because its Transformers requirements may differ from the inference client's. Follow [vLLM's GPU installation guide](https://docs.vllm.ai/en/v0.19.0/getting_started/installation/gpu/) and the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B).
 
 Set `TOOLSTAR_VLLM_BIN` to the directory containing the installed `vllm` executable. Set `TOOLSTAR_VLLM_MEDIA_ROOT` to the smallest shared directory containing both the input videos and the generated clips and frames. For the example below, place the datasets and evaluation workspace under the repository root.
 
@@ -37,7 +37,7 @@ export TOOLSTAR_VLLM_MEDIA_ROOT="$PWD"
 export CUDA_VISIBLE_DEVICES=0
 
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
-  --vllm --max-samples 3
+  --vllm
 ```
 
 The launcher starts local replicas on the visible GPUs that have enough free memory. To use an existing vLLM server, pass `--vllm-urls http://127.0.0.1:8000/v1`, set `TOOLSTAR_VLLM_MODEL` to the server's served model name, and configure its `--allowed-local-media-path` to match the shared media directory. The auto-launched replicas bind to loopback.
@@ -69,27 +69,15 @@ Extract any MVBench or MLVU video archives so the dataset paths point to playabl
 
 Keep model checkpoints under `MODEL_BASE_PATH` in their Hugging Face repository layout. Additional tools load their checkpoints on demand. See [settings.py](Retool_Video_RL/config/settings.py) for the paths used by audio QA, entity detection and tracking, emotion recognition, and image transforms. For speaker diarization, download `pyannote/speaker-diarization-community-1` and install `pyannote.audio`. To use a separate environment for diarization, set `DIARIZATION_PYTHON` to its Python executable.
 
-### Run all enabled datasets
+### Run the full three-dataset evaluation
+
+The default configuration enables MVBench, MLVU Dev, and Video-MME. After setting their dataset paths, run:
 
 ```bash
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json
 ```
 
-Append `--vllm` to use the configured vLLM backend. Use `--max-samples` for a quick check or `--parallel-samples` to limit concurrency. Progress and results accumulate across runs that share the same output paths. For an independent run, use a separate configuration with a fresh `workspaces_root`, `progress_path`, `results_path`, and `videomme_official_output_path`.
-
-### Run a stratified sample
-
-The sampler allocates questions by subset size within each dataset, selects samples whose videos are available, and balances Video-MME durations within those allocations.
-
-```bash
-python evaluationVideo/Mix/make_stratified_sample.py \
-  --config evaluationVideo/Mix/mix_config.json \
-  --counts mvbench=33,mlvu=33,videomme=34 \
-  --out-dir ./local_runs/stratified
-
-bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
-  --sample-uids @./local_runs/stratified/uids.txt
-```
+Append `--vllm` to use the configured vLLM backend or use `--parallel-samples` to limit concurrency. Progress and results accumulate across runs that share the same output paths. For an independent run, use a separate configuration with a fresh `workspaces_root`, `progress_path`, `results_path`, and `videomme_official_output_path`.
 
 ### Read accuracy by dataset and subset
 
