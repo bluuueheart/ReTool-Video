@@ -8,8 +8,8 @@ can run next to it (each worker keeps small embedding / ASR models on the GPU).
 
 CLI::
 
-    python vllm_pool.py plan   --devices 4,5,6,7      # dry-run, prints the plan
-    python vllm_pool.py up     --devices 4,5,6,7      # plan + launch + wait healthy
+    python vllm_pool.py plan   --devices 0      # dry-run, prints the plan
+    python vllm_pool.py up     --devices 0      # plan + launch + wait healthy
     python vllm_pool.py status
     python vllm_pool.py down
 """
@@ -22,10 +22,10 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 import urllib.request
 from dataclasses import dataclass, asdict
@@ -36,11 +36,8 @@ LOGGER = logging.getLogger("vllm_pool")
 
 GIB = 1024.0
 DEFAULT_ROOT = Path(os.environ.get("TOOLSTAR_VLLM_POOL_ROOT") or (Path(__file__).resolve().parents[2] / "local_runs" / "vllm_pool"))
-DEFAULT_MODEL = os.environ.get("TOOLSTAR_VLLM_MODEL_PATH") or str(Path(os.environ.get("MODEL_BASE_PATH", "/mnt/data/models")) / "Qwen/Qwen3.5-9B")
-# Directory holding the `vllm` executable (default: the interpreter running this script).
-DEFAULT_PYTHON_BIN = os.environ.get("TOOLSTAR_VLLM_BIN") or str(Path(sys.executable).parent)
-# Measured single-card knee (benchmark 2026-10-28): throughput peaks at 6 concurrent workers, 8 is slower.
-# Hard cap for the whole pipeline; env may only lower it.
+DEFAULT_MODEL = os.environ.get("TOOLSTAR_VLLM_MODEL_PATH") or str(Path(os.environ.get("MODEL_BASE_PATH", "./models")) / "Qwen/Qwen3.5-9B")
+# Cap on client workers per GPU. The environment can request a lower cap.
 HARD_MAX_WORKERS_PER_GPU = 6
 TOKENS_PER_KV_GIB = 8000  # measured on Qwen3.5-9B (hybrid attention): 36.75 GiB -> 300k tokens
 
@@ -64,6 +61,8 @@ class Replica:
     pid: int = 0
     owned: bool = False
     log: str = ""
+    process_start_ticks: Optional[int] = None
+    boot_id: Optional[str] = None
 
     @property
     def url(self) -> str:
@@ -147,7 +146,7 @@ def plan_replicas(
     if params.max_total_workers > 0:
         budget = params.max_total_workers
         for r in sorted(replicas, key=lambda r: -r.workers):
-            r.workers = min(r.workers, max(1, budget))
+            r.workers = min(r.workers, max(0, budget))
             budget -= r.workers
         replicas = [r for r in replicas if r.workers > 0]
     return replicas
@@ -208,12 +207,14 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
     env["CUDA_VISIBLE_DEVICES"] = rep.device
     if "VLLM_CACHE_ROOT" not in env and env.get("XDG_CACHE_HOME"):
         env["VLLM_CACHE_ROOT"] = str(Path(env["XDG_CACHE_HOME"]) / "vllm")
-    env["PATH"] = DEFAULT_PYTHON_BIN + ":" + env.get("PATH", "")
-    # ldconfig cache can point to a missing compat dir on rebuilt pods; Triton then cannot find libcuda.
-    if "TRITON_LIBCUDA_PATH" not in env and os.path.exists("/usr/local/nvidia/lib64/libcuda.so.1"):
-        env["TRITON_LIBCUDA_PATH"] = "/usr/local/nvidia/lib64"
+    vllm_bin_dir = os.environ.get("TOOLSTAR_VLLM_BIN")
+    if vllm_bin_dir:
+        env["PATH"] = str(Path(vllm_bin_dir).expanduser().resolve()) + os.pathsep + env.get("PATH", "")
+    executable = shutil.which("vllm", path=env.get("PATH"))
+    if executable is None:
+        raise RuntimeError("vLLM executable not found. Install vLLM or set TOOLSTAR_VLLM_BIN.")
     cmd = [
-        str(Path(DEFAULT_PYTHON_BIN) / "vllm"), "serve", model,
+        executable, "serve", model,
         "--served-model-name", served, "--host", "127.0.0.1", "--port", str(rep.port),
         "--max-model-len", str(rep.max_model_len),
         "--gpu-memory-utilization", str(rep.util),
@@ -232,7 +233,7 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
         # Thinking-mode replies: reasoning goes to a separate field, `content` keeps the answer only.
         cmd += ["--reasoning-parser", "qwen3"]
     if os.environ.get("TOOLSTAR_VLLM_PREFIX_CACHING", "1") != "0":
-        # Planner turns re-send a growing identical prefix (25k tokens: 0.72s -> 0.09s prefill).
+        # Planner turns reuse the conversation prefix.
         cmd.append("--enable-prefix-caching")
     lora = str(os.environ.get("TOOLSTAR_VLLM_LORA_MODULES", "") or "").strip()
     if lora:
@@ -240,16 +241,49 @@ def _launch(rep: Replica, *, model: str, served: str, root: Path, die_with_paren
         # model=<served name> is the untouched base). Unset keeps the old command line.
         cmd += ["--enable-lora", "--max-lora-rank", os.environ.get("TOOLSTAR_VLLM_MAX_LORA_RANK", "64"), "--max-loras", "1",
                 "--lora-modules", *lora.split(",")]
-    handle = open(log, "ab")
-    proc = subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
-                            preexec_fn=_die_with_parent if die_with_parent else None)
+    with log.open("ab") as handle:
+        proc = subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
+                                preexec_fn=_die_with_parent if die_with_parent else None)
     rep.pid, rep.owned, rep.log = proc.pid, True, str(log)
+    rep.process_start_ticks = _process_start_ticks(rep.pid)
+    rep.boot_id = _boot_id()
 
 
-def _kill(pid: int) -> None:
+def _boot_id() -> Optional[str]:
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except Exception:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+
+
+def _process_start_ticks(pid: int) -> Optional[int]:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat.rsplit(")", 1)[1].split()
+        if fields[0] in {"Z", "X"}:
+            return None
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _matches_process(replica: Replica) -> bool:
+    return (
+        replica.pid > 0
+        and replica.boot_id is not None
+        and replica.boot_id == _boot_id()
+        and replica.process_start_ticks is not None
+        and replica.process_start_ticks == _process_start_ticks(replica.pid)
+    )
+
+
+def _stop_replica(replica: Replica) -> None:
+    if not _matches_process(replica):
+        return
+    try:
+        if os.getpgid(replica.pid) == replica.pid:
+            os.killpg(replica.pid, signal.SIGTERM)
+    except ProcessLookupError:
         pass
 
 
@@ -262,7 +296,9 @@ def _write_plan(root: Path, model: str, served: str, replicas: Sequence[Replica]
         "total_workers": sum(r.workers for r in replicas),
         "base_urls": ",".join(r.url for r in replicas),
     }
-    plan_path(root).write_text(json.dumps(plan, indent=2))
+    temporary_path = root / f".plan-{os.getpid()}.json"
+    temporary_path.write_text(json.dumps(plan, indent=2))
+    temporary_path.replace(plan_path(root))
     return plan
 
 
@@ -289,6 +325,10 @@ def ensure_pool(
     reused: List[Replica] = []
     for item in existing.get("replicas", []):
         rep = Replica(**{k: item[k] for k in Replica.__dataclass_fields__ if k in item})
+        if not _matches_process(rep):
+            continue
+        if (existing.get("model_path"), existing.get("served_name")) != (model, served):
+            raise RuntimeError(f"Pool at {root} is running a different model. Stop it or use another pool root.")
         if rep.device in devices and _healthy(rep.url):
             rep.owned = False  # someone else (an earlier run) owns it; do not stop it on exit
             reused.append(rep)
@@ -301,8 +341,10 @@ def ensure_pool(
         gpus = [g for g in probe_gpus([d for d in devices if d not in reused_devices | excluded])]
         ports = {g.index: 8100 + int(g.index) for g in gpus}
         for g in gpus:
-            if not _port_free(ports[g.index]):
-                ports[g.index] += 100
+            port = next((port for port in (ports[g.index], ports[g.index] + 100) if _port_free(port)), None)
+            if port is None:
+                raise RuntimeError(f"No available vLLM port for GPU {g.index}.")
+            ports[g.index] = port
         todo = plan_replicas(gpus, params, ports=ports)
         if needed_workers:
             have = sum(r.workers for r in reused + launched)
@@ -329,21 +371,18 @@ def ensure_pool(
         pending = list(todo)
         while pending and time.time() < deadline:
             for rep in list(pending):
-                if _healthy(rep.url):
+                if not _matches_process(rep):
+                    pending.remove(rep)
+                    failed.append(rep)
+                elif _healthy(rep.url):
                     pending.remove(rep)
                     launched.append(rep)
                     LOGGER.info("vLLM replica GPU=%s healthy", rep.device)
-                else:
-                    try:
-                        os.kill(rep.pid, 0)
-                    except OSError:
-                        pending.remove(rep)
-                        failed.append(rep)
             time.sleep(3)
         failed.extend(pending)
         for rep in failed:
             LOGGER.warning("vLLM replica GPU=%s failed to start (see %s); excluding the card", rep.device, rep.log)
-            _kill(rep.pid)
+            _stop_replica(rep)
             excluded.add(rep.device)
         if not failed:
             break
@@ -353,14 +392,16 @@ def ensure_pool(
         raise RuntimeError("No GPU has enough free memory for a vLLM replica (see vllm_pool plan).")
     plan = _write_plan(root, model, served, replicas)
     if stop_on_exit and launched:
-        pids = [r.pid for r in launched]
-        atexit.register(lambda: [_kill(p) for p in pids])
+        def stop_launched_replicas():
+            for replica in launched:
+                _stop_replica(replica)
+
+        atexit.register(stop_launched_replicas)
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous = signal.getsignal(sig)
 
-            def _handler(signum, frame, _prev=previous, _pids=pids):
-                for p in _pids:
-                    _kill(p)
+            def _handler(signum, frame, _prev=previous):
+                stop_launched_replicas()
                 signal.signal(signum, _prev if callable(_prev) else signal.SIG_DFL)
                 os.kill(os.getpid(), signum)
 
@@ -371,9 +412,10 @@ def ensure_pool(
 def stop_pool(root: Path = DEFAULT_ROOT) -> None:
     plan = load_plan(plan_path(root)) or {}
     for item in plan.get("replicas", []):
-        pid = int(item.get("pid") or 0)
-        if pid:
-            _kill(pid)
+        replica = Replica(**item)
+        if replica.pid and (replica.process_start_ticks is None or replica.boot_id is None):
+            LOGGER.warning("Skipping unverifiable PID %s from legacy pool plan.", replica.pid)
+        _stop_replica(replica)
     try:
         plan_path(root).unlink()
     except FileNotFoundError:
@@ -410,27 +452,35 @@ def workers_for_device(device: str, plan: Optional[Dict[str, Any]] = None) -> in
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("plan", "up", "status", "down"))
-    ap.add_argument("--devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("TOOLSTAR_ALLOWED_GPUS", "0,1,6,7")))
-    ap.add_argument("--root", default=str(DEFAULT_ROOT))
-    args = ap.parse_args()
-    devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("plan", "up", "status", "down"))
+    parser.add_argument("--devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("TOOLSTAR_ALLOWED_GPUS")))
+    parser.add_argument("--root", default=str(DEFAULT_ROOT))
+    args = parser.parse_args()
+    if args.command in {"plan", "up"}:
+        devices = (
+            [gpu.index for gpu in probe_gpus()]
+            if args.devices is None
+            else [device.strip() for device in args.devices.split(",") if device.strip() and device.strip() != "-1"]
+        )
+        if not devices:
+            parser.error("No GPUs selected. Set --devices or CUDA_VISIBLE_DEVICES.")
     root = Path(args.root)
-    if args.cmd == "plan":
+    if args.command == "plan":
         gpus = probe_gpus(devices)
         for g in gpus:
             print(f"GPU {g.index}: total={g.total_gib:.0f} used={g.used_gib:.1f} free={g.free_gib:.1f} GiB")
         reps = plan_replicas(gpus, PlanParams.from_env())
         print(json.dumps([asdict(r) for r in reps], indent=2))
         print("total workers:", sum(r.workers for r in reps))
-    elif args.cmd == "up":
+    elif args.command == "up":
         plan = ensure_pool(devices, root=root, stop_on_exit=False)
         print(json.dumps(plan, indent=2))
-    elif args.cmd == "status":
+    elif args.command == "status":
         plan = load_plan(plan_path(root)) or {}
         for rep in plan.get("replicas", []):
-            print(rep["device"], rep["port"], "healthy" if _healthy(f"http://127.0.0.1:{rep['port']}/v1") else "DOWN")
+            replica = Replica(**rep)
+            print(replica.device, replica.port, "healthy" if _matches_process(replica) and _healthy(replica.url) else "DOWN")
     else:
         stop_pool(root)
 

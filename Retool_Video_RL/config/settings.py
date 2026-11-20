@@ -3,11 +3,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Global settings for the Tool Star RL framework."""
+    """Global settings for the ReTool-Video inference pipeline."""
     
     # OpenAI Configuration
     openai_api_key: str = ""
@@ -26,9 +27,11 @@ class Settings(BaseSettings):
     max_iterations: int = 15
     # Resolver budget counts model turns containing top-level Search, not all LLM calls.
     # Multiple requests in one Search turn share one round; Actions/Return do not consume it.
-    subagent_max_iterations: int = 3
+    subagent_max_iterations: int = Field(
+        default=3, validation_alias=AliasChoices("resolver_max_search_rounds", "subagent_max_iterations")
+    )
     enable_streaming: bool = False
-    # Aligned with VAS: thinking + answer budget of the model-card thinking mode (vLLM serves 262144 tokens).
+    # Output budget includes reasoning and the final answer.
     planner_max_generation_tokens: int = 24576
     planner_min_thinking_generation_tokens: int = 24576
     subagent_max_generation_tokens: int = 2048
@@ -125,7 +128,7 @@ class Settings(BaseSettings):
     tool_search_embedding_sidecar_replica_count: int = 1
     grounding_embedding_sidecar_replica_count: int = 1
     # Optional per-role overrides. Edit these in config instead of exporting
-    # TOOL_STAR_* variables for every training run.
+    # TOOL_STAR_* variables for every run.
     non_planner_role_providers: Dict[str, str] = {}
     non_planner_role_api_keys: Dict[str, str] = {}
     non_planner_role_api_bases: Dict[str, str] = {}
@@ -147,8 +150,7 @@ class Settings(BaseSettings):
         "preprocess_vector": "http://127.0.0.1:18002/v1",
     }
     non_planner_embedding_role_models: Dict[str, str] = {}
-    # Preprocessing models are inference-only. Keep them off the RL actor CUDA
-    # context unless explicitly changed here.
+    # Whisper can run on CPU when GPU memory or CUDA libraries are limited.
     preprocess_asr_device: str = "cuda"
     per_device_max_memory_gb: Optional[float] = None
     planner_visual_observation_token_budget: int = 12288
@@ -172,10 +174,10 @@ class Settings(BaseSettings):
     video_clip_qa_processor_max_pixels: int = 65536 * 32 * 32
     video_clip_qa_max_frames: int = 80
     video_clip_qa_max_pixels: int = 768 * 32 * 32
-    # Compact JSON answer contract (aligned with VAS); a small cap stops verbose/looping reasoning.
+    # The concise JSON answer uses this limit when thinking mode is disabled.
     video_clip_qa_max_new_tokens: int = 256
     # Video_Clip_QA thinks by default (also for the first-round whole-video grounding QA); the thinking mode
-    # uses the model-card sampling and this thinking+answer output budget (same as the VAS whole-video view).
+    # includes reasoning and the answer in the output budget.
     video_clip_qa_enable_thinking: bool = True
     # Resolver review turn: on = delegated-request checklist (coverage/products/consistency); off = the original
     # "Continue reasoning:".
@@ -213,9 +215,8 @@ class Settings(BaseSettings):
     processed_frames_subdir: str = "frames"
     processed_clips_subdir: str = "clips"
     
-    # Model Base Path - User only needs to modify this ONE line
-
-    model_base_path: str = "/mnt/data/models"
+    # Model paths are relative to the working directory unless MODEL_BASE_PATH is set.
+    model_base_path: str = "./models"
     planner_model_subpath: str = "Qwen/Qwen3.5-9B"
     subagent_model_subpath: str = "Qwen/Qwen3.5-9B"
     preprocess_model_subpath: str = "Qwen/Qwen3.5-9B"

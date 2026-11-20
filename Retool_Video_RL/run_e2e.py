@@ -1,5 +1,5 @@
 """
-Tool Star RL - End-to-end runner.
+ReTool-Video - End-to-end runner.
 Video preprocessing + ReAct query pipeline.
 """
 from __future__ import annotations
@@ -602,7 +602,7 @@ def _get_visual_helpers():
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Tool Star RL end-to-end on one video/query pair.",
+        description="Run ReTool-Video end-to-end on one video/query pair.",
     )
     parser.add_argument("video_path", help="Path to the input video file.")
     parser.add_argument("query", help="Top-level user query to answer against the video.")
@@ -2972,7 +2972,7 @@ async def _execute_pipeline_impl(
             disable_meta_tools=bool(runtime_disable_meta_tools),
         ):
             logger.info("=" * 80)
-            logger.info("Tool Star RL - End-to-End Pipeline")
+            logger.info("ReTool-Video - End-to-End Pipeline")
             logger.info("=" * 80)
             logger.info("Video: %s", video_path)
             logger.info("Query: %s", query)

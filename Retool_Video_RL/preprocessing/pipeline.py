@@ -470,7 +470,7 @@ class VideoPreprocessingPipeline:
                 video_path=video_path,
             )
 
-        # Release GPU Whisper once transcripts exist (same as VAS); a reusable worker can opt out.
+        # Release GPU Whisper once transcripts exist. Reusable workers may retain it.
         if str(os.environ.get("TOOLSTAR_PERSIST_ASR_RUNTIME", "")).strip().lower() not in {"1", "true", "yes", "on"}:
             self.asr_processor.unload_model()
 

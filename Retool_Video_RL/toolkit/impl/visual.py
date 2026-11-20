@@ -1562,7 +1562,7 @@ def _big_decode_slot(video_path: Path):
 
     vLLM decodes every frame of a video file before sampling it, so a long 25-30 fps video needs hundreds of GB of
     host memory; several at once exhaust the container. Each call reserves its decoded size in a cross-process ledger
-    (shared with the VAS runner when TMPDIR is the same) and waits until it fits under TOOLSTAR_DECODE_BUDGET_GB.
+    and waits for room in the shared TOOLSTAR_DECODE_BUDGET_GB budget.
     """
     budget = float(os.environ.get("TOOLSTAR_DECODE_BUDGET_GB", "600")) * 1e9
     try:
@@ -1652,7 +1652,7 @@ def _downsample_video_for_whole_qa(video_path: Path, target_fps: float) -> Optio
     """Re-encode a long video at ``target_fps`` and a bounded height so the server decodes only the frames it uses.
 
     Used only when sampling the whole file at the requested fps would overflow the model context or the host decode
-    budget (e.g. 30-60 minute videos); the original path keeps the exact VAS-style server-side sampling. Cached by
+    budget. The cache is keyed by
     (path, mtime, size, fps, height) and safe under concurrent workers.
     """
     from filelock import FileLock
@@ -1779,7 +1779,7 @@ def _answer_video_clip_qa_with_provider(
         served_by_vllm = False
 
     if served_by_vllm:
-        # vLLM path (aligned with the VAS whole-video view): the file goes in as a video and the server samples it at
+        # vLLM receives the video file and samples it at
         # `fps` (no client-side frame cap; the context is the server's 262144 tokens); thinking is on by default with
         # the model-card thinking-mode sampling and the thinking+answer output budget.
         video_item.pop("max_frames", None)

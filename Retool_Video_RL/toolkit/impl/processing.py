@@ -344,7 +344,7 @@ class PythonExecutor(BaseTool):
         """
         context_vars = context_vars or {}
         
-        # Create safe execution environment
+        # Supply helper modules to the generated code. This runs in the current Python process.
         local_vars = dict(context_vars)
         global_vars = {
             "__builtins__": __builtins__,
@@ -464,13 +464,11 @@ class SQLExecutor(BaseTool):
             return {"error": msg}
         
         try:
-            con = duckdb.connect(database=":memory:")
-            for name, rows in tables.items():
-                df = pd.DataFrame(rows)
-                con.register(name, df)
-            query = sql_query if limit is None else f"SELECT * FROM ({sql_query}) t LIMIT {int(limit)}"
-            result_df = con.execute(query).fetchdf()
-            con.close()
+            with duckdb.connect(database=":memory:", config={"enable_external_access": False}) as connection:
+                for name, rows in tables.items():
+                    connection.register(name, pd.DataFrame(rows))
+                query = sql_query if limit is None else f"SELECT * FROM ({sql_query}) t LIMIT {int(limit)}"
+                result_df = connection.execute(query).fetchdf()
             return result_df.to_dict(orient="records")
         except Exception as e:
             msg = f"SQL execution failed: {e}"

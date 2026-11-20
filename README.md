@@ -21,6 +21,8 @@ python Retool_Video_RL/run_e2e.py /path/to/video.mp4 \
   --runtime-profile evaluation_local
 ```
 
+The default model directory is `./models` relative to the working directory. To configure inference with an environment file, copy `Retool_Video_RL/.env.example` to `.env` in the repository root. `RESOLVER_MAX_SEARCH_ROUNDS` sets the number of model turns per resolver node that may contain a top-level Search. The legacy `SUBAGENT_MAX_ITERATIONS` name remains accepted.
+
 Use `hf auth login` for gated checkpoints and datasets. If your CTranslate2 installation cannot use the available CUDA libraries, set `PREPROCESS_ASR_DEVICE=cpu` to run Whisper on the CPU. Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
 
 ### Optional vLLM backend
@@ -33,7 +35,6 @@ Set `TOOLSTAR_VLLM_BIN` to the directory containing the installed `vllm` executa
 export TOOLSTAR_VLLM_BIN=/path/to/vllm-env/bin
 export TOOLSTAR_VLLM_MEDIA_ROOT="$PWD"
 export CUDA_VISIBLE_DEVICES=0
-export TOOLSTAR_VLLM_REQUEST_SEED=20261110
 
 bash evaluationVideo/Mix/run_mix_batch.sh evaluationVideo/Mix/mix_config.json \
   --vllm --max-samples 3
@@ -100,6 +101,10 @@ The Video-MME `official_breakdown` under `summary_by_dataset.videomme` also repo
 jq '.subset_summaries_by_dataset' evaluationVideo/Mix/Mix_result.json
 ```
 
+## Running with untrusted inputs
+
+`Python_Executor` runs model-generated Python with the permissions of the inference process. Run the evaluator with only the files and credentials it needs, or disable this tool by setting `DISABLED_TOOL_NAMES_BASE='["Python_Executor"]'`.
+
 ## Acknowledgement
 
-The vLLM provider and related inference paths build on [VAS](https://github.com/bluuueheart/VAS). We thank the maintainers of [vLLM](https://github.com/vllm-project/vllm), [Transformers](https://github.com/huggingface/transformers), [verl](https://github.com/volcengine/verl), and the [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench), [MLVU](https://github.com/JUNJIE99/MLVU), and [Video-MME](https://github.com/MME-Benchmarks/Video-MME) benchmarks.
+We thank the maintainers of [vLLM](https://github.com/vllm-project/vllm), [Transformers](https://github.com/huggingface/transformers), [verl](https://github.com/volcengine/verl), and the [MVBench](https://huggingface.co/datasets/OpenGVLab/MVBench), [MLVU](https://github.com/JUNJIE99/MLVU), and [Video-MME](https://github.com/MME-Benchmarks/Video-MME) benchmarks.

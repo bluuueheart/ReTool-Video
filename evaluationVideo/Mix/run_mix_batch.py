@@ -656,9 +656,9 @@ def _extract_worker_result_payload(stdout_text: str) -> Optional[Dict[str, Any]]
 
 
 def _visible_cuda_device_ids() -> List[str]:
-    raw_visible = str(os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
-    if raw_visible:
-        return [item.strip() for item in raw_visible.split(",") if item.strip()]
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("TOOLSTAR_ALLOWED_GPUS"))
+    if visible_devices is not None:
+        return [device.strip() for device in visible_devices.split(",") if device.strip() and device.strip() != "-1"]
     try:
         import torch
 
@@ -1421,21 +1421,23 @@ def _run_worker_mode(args: argparse.Namespace) -> None:
 
 def _setup_vllm_backend(args: argparse.Namespace, visible_device_ids: Sequence[str]) -> None:
     """Point every LLM role at vLLM (env is inherited by sample worker subprocesses)."""
+    urls = str(args.vllm_urls or os.environ.get("TOOLSTAR_VLLM_BASE_URLS") or "").strip()
+    backend = os.environ.get("TOOLSTAR_LLM_BACKEND", "").strip().lower()
+    if not (args.vllm or args.vllm_urls or backend == "vllm"):
+        return
+
     project_root = str(_retool_video_root().resolve())
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
     from config.settings import settings
 
-    urls = str(args.vllm_urls or os.environ.get("TOOLSTAR_VLLM_BASE_URLS") or "").strip()
-    wanted = bool(args.vllm or args.vllm_urls or str(os.environ.get("TOOLSTAR_LLM_BACKEND", "")).strip().lower() == "vllm")
-    if not wanted:
-        return
     if args.vllm and not urls:
         import vllm_pool
 
-        devices = list(visible_device_ids) or os.environ.get("TOOLSTAR_ALLOWED_GPUS", "0").split(",")
+        if not visible_device_ids:
+            raise RuntimeError("--vllm requires a visible CUDA GPU or an existing server specified with --vllm-urls.")
         pool_plan = vllm_pool.ensure_pool(
-            devices,
+            visible_device_ids,
             model=str(Path(settings.planner_model_path).resolve()),
             stop_on_exit=not (args.keep_vllm or str(os.environ.get("TOOLSTAR_VLLM_KEEP", "")).strip() in {"1", "true"}),
             needed_workers=None,  # bring up a replica on every visible card
@@ -1448,6 +1450,8 @@ def _setup_vllm_backend(args: argparse.Namespace, visible_device_ids: Sequence[s
             "vLLM pool: %s",
             {r["device"]: f"port={r['port']} max_len={r['max_model_len']}" for r in pool_plan["replicas"]},
         )
+    if not urls:
+        raise RuntimeError("vLLM selected without an endpoint. Set TOOLSTAR_VLLM_BASE_URLS or pass --vllm to launch it.")
     os.environ["TOOLSTAR_LLM_BACKEND"] = "vllm"
     os.environ["TOOLSTAR_VLLM_BASE_URLS"] = urls
     os.environ.setdefault("TOOLSTAR_VLLM_MODEL_PATH", str(Path(settings.planner_model_path).resolve()))
