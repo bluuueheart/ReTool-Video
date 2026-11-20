@@ -23,9 +23,9 @@ python Retool_Video_RL/run_e2e.py /path/to/video.mp4 \
   --runtime-profile evaluation_local
 ```
 
-The default model directory is `./models` relative to the working directory. To configure inference with an environment file, copy `Retool_Video_RL/.env.example` to `.env` in the repository root. `RESOLVER_MAX_SEARCH_ROUNDS` sets the number of model turns per resolver node that may contain a top-level Search. The legacy `SUBAGENT_MAX_ITERATIONS` name remains accepted.
+The default model directory is `./models` relative to the working directory. To configure inference with an environment file, copy `Retool_Video_RL/.env.example` to `.env` in the repository root. `RESOLVER_MAX_SEARCH_ROUNDS` sets the number of model turns per resolver node that may contain a top-level Search.
 
-Run `hf auth login` before downloading gated checkpoints or datasets. GPU Whisper requires CUDA 12 cuBLAS and cuDNN 9 available to the dynamic linker. Set `PREPROCESS_ASR_DEVICE=cpu` to leave Whisper on the CPU while the video models run on CUDA. See the [Faster Whisper GPU requirements](https://github.com/SYSTRAN/faster-whisper#gpu). Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
+GPU Whisper requires CUDA 12 cuBLAS and cuDNN 9 available to the dynamic linker. See the [Faster Whisper GPU requirements](https://github.com/SYSTRAN/faster-whisper#gpu). Model paths and inference budgets are defined in [settings.py](Retool_Video_RL/config/settings.py).
 
 ### Optional vLLM backend
 
